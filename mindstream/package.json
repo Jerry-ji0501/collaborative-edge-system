@@ -1,0 +1,16 @@
+{
+  "name": "mindstream",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A procedural, hand-drawn-feeling 30s motion short rendered with Canvas 2D.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && node scripts/inline.mjs",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vite": "^5.4.10"
+  }
+}
