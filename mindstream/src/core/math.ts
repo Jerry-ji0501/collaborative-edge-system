@@ -58,6 +58,16 @@ export const dampedCos = (tau: number, freq: number, decay: number): number =>
 
 export const mod = (a: number, n: number): number => ((a % n) + n) % n;
 
+/** When a rising function f first reaches `target` within [lo, hi] (bisection). */
+export function reach(f: (t: number) => number, target: number, lo: number, hi: number): number {
+  for (let i = 0; i < 40; i++) {
+    const m = (lo + hi) / 2;
+    if (f(m) < target) lo = m;
+    else hi = m;
+  }
+  return hi;
+}
+
 /** ∫ smoothstep(a,b,τ) dτ from -∞ to t — used to ramp angular velocities deterministically. */
 export function smoothInt(t: number, a: number, b: number): number {
   if (t <= a) return 0;

@@ -1,7 +1,7 @@
 // Scene 02 — a spark swells into a living dendritic network; one branch pulls taut into a beam of light.
 import { Ctx, boilOf, glow, ribbonPath, softGlow, sparkle, tracePath, wobbleCirclePath } from '../core/draw';
 import { C, RGB, hex, mix, rgba } from '../core/color';
-import { E, TAU, clamp, lerp, mod, seg } from '../core/math';
+import { E, TAU, clamp, lerp, mod, reach, seg } from '../core/math';
 import { RNG } from '../core/rng';
 import { ENTRY, SPARK } from '../core/geometry';
 import { darkness } from '../core/timeline';
@@ -63,6 +63,7 @@ const sats: Sat[] = [];
 const speedOf: number[] = [];
 const pulses: Pulse[] = [];
 const sparks: Spark[] = [];
+const flicks: { x: number; y: number; t: number }[] = []; // where each trio of sparks is thrown (for the soundtrack)
 const nodes: Node[] = [];
 const nodeOfSeg = new Map<number, number>();
 let selPath: Float32Array = new Float32Array(0);
@@ -182,6 +183,7 @@ function buildPath(chain: number[], start: [number, number] | null): { path: Flo
     for (let sd = 70; sd < pulse.L; sd += rng.range(80, 140)) {
       const [ex, ey] = pointAt(pulse.path, pulse.cum, pulse.n, sd);
       const te = pulse.t0 + (inward ? pulse.L - sd : sd) / pulse.speed;
+      flicks.push({ x: ex, y: ey, t: te });
       for (let k = 0; k < 3; k++) {
         const a = rng.range(0, TAU);
         const v = rng.range(60, 180);
@@ -239,6 +241,79 @@ export function netCam(t: number): { ax: number; ay: number; zoom: number; rot: 
   };
 }
 
+/** The network fades into dusk as the chosen branch becomes the beam. */
+const netFade = (t: number): number => 1 - seg(t, 6.55, 7.45, E.inOutSine);
+
+// ------------------------------------------------------------------ soundtrack cues
+// Read from the same seeded build the picture draws, so every crackle lands on its spark.
+
+function netScreen(t: number, x: number, y: number): [number, number] {
+  const c = netCam(t);
+  const cs = Math.cos(c.rot);
+  const sn = Math.sin(c.rot);
+  return [c.ax + c.zoom * (x * cs - y * sn), c.ay + c.zoom * (x * sn + y * cs)];
+}
+
+export interface NeuronCue {
+  t: number;
+  x: number; // screen position (for panning)
+  y: number;
+  kind: 'flick' | 'flare' | 'bloom'; // sparks thrown · a junction flaring · a satellite cell lighting up
+  a: number; // visibility 0..1: network fade, and whether it is on screen at all
+  r: number; // node / cell radius
+}
+
+export function neuronCues(): NeuronCue[] {
+  const out: NeuronCue[] = [];
+  const push = (t: number, lx: number, ly: number, kind: NeuronCue['kind'], r: number): void => {
+    if (t < BURST || t > 7.85) return;
+    const [x, y] = netScreen(t, lx, ly);
+    const a = x > -40 && x < 1960 && y > -40 && y < 1120 ? netFade(t) : 0;
+    if (a > 0.01) out.push({ t, x, y, kind, a, r });
+  };
+  for (const f of flicks) push(f.t, f.x, f.y, 'flick', 1);
+  for (const nd of nodes) for (const te of nd.events) if (front(te, nd.bid) >= nd.d) push(te, nd.x, nd.y, 'flare', nd.r);
+  for (const s of sats) {
+    // the cell starts to pop the moment the growth front reaches it
+    const arrive = (t: number): number => front(t, s.bid);
+    if (arrive(BURST + 1.55) < s.d - 40) continue;
+    push(reach(arrive, s.d - 40, BURST, BURST + 1.55), s.x, s.y, 'bloom', s.r);
+  }
+  return out.sort((p, q) => p.t - q.t);
+}
+
+/** How fast the network is still growing: the growth front's speed, 1 at the burst → 0. */
+export function growthRate(t: number): number {
+  const tau = t - BURST;
+  return tau <= 0 || tau >= 1.55 ? 0 : Math.pow(1 - tau / 1.55, 0.7);
+}
+
+/** Travelling signals visible right now, weighted by the network fade (same test the picture uses). */
+export function signalLoad(t: number): number {
+  if (t < BURST || t > 7.85) return 0;
+  let c = 0;
+  for (const p of pulses) {
+    let s = (t - p.t0) * p.speed;
+    if (s < 0 || s > p.L) continue;
+    if (p.inward) s = p.L - s;
+    if (front(t, p.bid) >= p.d0 + s) c++;
+  }
+  return c * netFade(t);
+}
+
+/** The chosen branch's beats: it glows up, pulls taut and hands over to the beam. */
+const SEL_GLOW: [number, number] = [6.45, 6.85];
+const SEL_FADE: [number, number] = [7.62, 7.78];
+const SEL_TAUT: [number, number] = [6.9, 7.7];
+
+/** For the soundtrack: the branch's glow (0..1) and how taut it has been pulled (0..1). */
+export function branchTension(t: number): { glow: number; taut: number } {
+  return {
+    glow: seg(t, SEL_GLOW[0], SEL_GLOW[1], E.inOutSine) * (1 - seg(t, SEL_FADE[0], SEL_FADE[1])),
+    taut: seg(t, SEL_TAUT[0], SEL_TAUT[1]),
+  };
+}
+
 const TMP = new Float32Array(512);
 
 export function drawNeurons(ctx: Ctx, t: number): void {
@@ -246,7 +321,7 @@ export function drawNeurons(ctx: Ctx, t: number): void {
   const dark = darkness(t);
   const boil = boilOf(t);
   const cam = netCam(t);
-  const netA = 1 - seg(t, 6.55, 7.45, E.inOutSine);
+  const netA = netFade(t);
   const lineCol = mix(C.ink, hex('#A99BE0'), dark);
 
   ctx.save();
@@ -437,9 +512,9 @@ const SEL = new Float32Array(1024);
 
 /** The chosen branch glows, pulls taut and becomes the horizontal beam line. */
 function drawSelected(ctx: Ctx, t: number, cam: { ax: number; ay: number; zoom: number; rot: number }): void {
-  if (t < 6.45 || t > 7.8) return;
-  const glowUp = seg(t, 6.45, 6.85, E.inOutSine);
-  const fade = 1 - seg(t, 7.62, 7.78);
+  if (t < SEL_GLOW[0] || t > 7.8) return;
+  const glowUp = seg(t, SEL_GLOW[0], SEL_GLOW[1], E.inOutSine);
+  const fade = 1 - seg(t, SEL_FADE[0], SEL_FADE[1]);
   const cs = Math.cos(cam.rot);
   const sn = Math.sin(cam.rot);
   for (let i = 0; i < selN; i++) {
@@ -454,7 +529,7 @@ function drawSelected(ctx: Ctx, t: number, cam: { ax: number; ay: number; zoom: 
     SEL[2 * i] = lerp(px, tx, s);
     SEL[2 * i + 1] = lerp(py, ty, s);
   }
-  const taut = seg(t, 6.9, 7.7);
+  const taut = seg(t, SEL_TAUT[0], SEL_TAUT[1]);
   const col = mix(hex('#C8B8FF'), C.white, taut);
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';

@@ -1,5 +1,6 @@
 // Boot: DPR-aware 16:9 canvas, deterministic 30 fps clock, minimal keyboard controls, capture hooks.
 import { renderFilm } from './film';
+import { Soundtrack, renderSoundtrack, wav } from './audio/engine';
 import { buildTextures } from './core/texture';
 import { DURATION, FPS, SECTIONS, TOTAL_FRAMES } from './core/timeline';
 import { W } from './core/math';
@@ -8,6 +9,7 @@ import './style.css';
 const canvas = document.getElementById('film') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d', { alpha: false })!;
 const bar = document.getElementById('progress') as HTMLDivElement | null;
+const soundBtn = document.getElementById('sound') as HTMLButtonElement | null;
 const params = new URLSearchParams(location.search);
 const capture = params.has('capture');
 
@@ -67,6 +69,10 @@ function draw(t: number): void {
   }
 }
 
+// ---- sound: synthesised live and slaved to the clock below (browsers allow audio only after a gesture)
+const sound = new Soundtrack(params.has('mute'));
+sound.onchange = (on) => soundBtn?.setAttribute('aria-pressed', String(on));
+
 // ---- clock: wall time quantised to whole frames so every playback shows identical frames
 let playing = !capture;
 let origin = performance.now();
@@ -80,6 +86,7 @@ function tick(now: number): void {
     draw(frame / FPS);
     lastFrame = frame;
   }
+  sound.pump();
   requestAnimationFrame(tick);
 }
 
@@ -87,6 +94,7 @@ function setPlaying(p: boolean): void {
   playing = p;
   if (p) origin = performance.now() - (frame / FPS) * 1000;
   document.body.classList.toggle('paused', !p);
+  sound.transport(p, origin);
 }
 
 window.addEventListener('resize', resize);
@@ -104,9 +112,41 @@ window.addEventListener('keydown', (e) => {
   } else if (e.key === 'f' || e.key === 'F') {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen?.();
+  } else if (e.key === 'm' || e.key === 'M') {
+    sound.toggle();
   }
 });
-canvas.addEventListener('click', () => setPlaying(!playing));
+
+// The first press anywhere turns the sound on — and a first click on the film does only that, rather
+// than pausing it. M (or the speaker that shows with the hairline) toggles it from then on.
+let armed = false;
+if (!capture) {
+  window.addEventListener(
+    'pointerdown',
+    (e) => {
+      armed = !soundBtn?.contains(e.target as Node) && sound.enable();
+    },
+    true,
+  );
+  window.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.key !== 'm' && e.key !== 'M') sound.enable();
+    },
+    true,
+  );
+  window.addEventListener('touchend', () => sound.enable(), true);
+  document.addEventListener('visibilitychange', () => sound.setHidden(document.hidden));
+  soundBtn?.addEventListener('click', () => sound.toggle());
+}
+canvas.addEventListener('click', () => {
+  if (armed) {
+    armed = false;
+    if (!playing) setPlaying(true);
+    return;
+  }
+  setPlaying(!playing);
+});
 
 // optional chapter strip (used by the embedded player page)
 if (chapterHost) {
@@ -138,7 +178,7 @@ window.addEventListener('pointermove', () => {
 // hooks for headless frame capture
 declare global {
   interface Window {
-    __film: { renderAt: (t: number) => number; duration: number; fps: number };
+    __film: { renderAt: (t: number) => number; renderAudio: () => Promise<string>; duration: number; fps: number };
   }
 }
 window.__film = {
@@ -146,6 +186,13 @@ window.__film = {
     const t0 = performance.now();
     draw(t);
     return performance.now() - t0;
+  },
+  /** The whole soundtrack rendered offline, as a base64 16-bit stereo WAV aligned to frame 0. */
+  renderAudio: async () => {
+    const bytes = wav(await renderSoundtrack());
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(s);
   },
   duration: DURATION,
   fps: FPS,

@@ -1,7 +1,7 @@
 // Scene 01 / 10 — the little orange creature. Pose is a pure function of time.
 import { Ctx, boilOf, glow, tracePath } from '../core/draw';
 import { C, RGB, hex, mix, rgba } from '../core/color';
-import { E, TAU, bump, clamp, dampedCos, dampedSin, lerp, seg } from '../core/math';
+import { E, TAU, bump, clamp, dampedCos, dampedSin, lerp, reach, seg } from '../core/math';
 import { noise1 } from '../core/noise';
 import { CREATURE_X, GROUND_Y } from '../core/geometry';
 
@@ -63,8 +63,20 @@ const blinkAt = (t: number, t0: number, dur = 0.16): number => {
   return Math.pow(Math.sin(Math.PI * x), 0.6);
 };
 
+export interface Hop {
+  tA: number; // anticipation (squash) starts
+  tUp: number; // take-off
+  tLand: number; // touch-down
+  height: number;
+}
+/** The two hops. The soundtrack springs on these same beats. */
+export const HOPS: { intro: Hop; finale: Hop } = {
+  intro: { tA: 3.24, tUp: 3.36, tLand: 3.62, height: 34 },
+  finale: { tA: 29.14, tUp: 29.24, tLand: 29.52, height: 42 },
+};
+
 /** Squash → leap → land, as offsets. */
-function hop(p: Pose, t: number, tA: number, tUp: number, tLand: number, height: number): void {
+function hop(p: Pose, t: number, { tA, tUp, tLand, height }: Hop): void {
   const ant = bump(t, tA, tUp + 0.02);
   p.sy -= 0.1 * ant;
   p.sx += 0.07 * ant;
@@ -100,13 +112,39 @@ function walkSpeed(t: number): number {
   if (t <= T2) return V0 * (1 - (t - T1) / (T2 - T1));
   return 0;
 }
+/** Distance covered per half gait cycle: one foot plants every HALF_STRIDE px. */
+const HALF_STRIDE = 96;
+
+export interface Footfall {
+  t: number;
+  x: number; // body x (screen) when the foot plants
+  k: number; // stride strength 0..1 (walk speed / cruise speed)
+  side: number; // -1 / 1: which foot
+}
+
+/**
+ * Every time a foot meets the ground during the walk-in: the gait phase crosses π/2 + nπ, where the
+ * lifted foot's height reaches 0, the bounce bottoms out and the squash peaks. The last one is the
+ * trailing foot settling as the stride amplitude reaches zero at the stop.
+ */
+export function footfalls(): Footfall[] {
+  const out: Footfall[] = [];
+  const total = walkDist(T2);
+  for (let n = 0; HALF_STRIDE * (n + 0.5) < total; n++) {
+    const d = HALF_STRIDE * (n + 0.5);
+    const t = reach(walkDist, d, 0, T2);
+    out.push({ t, x: X0 + d, k: walkSpeed(t) / V0, side: n % 2 ? 1 : -1 });
+  }
+  out.push({ t: T2, x: X0 + total, k: 0, side: out.length % 2 ? 1 : -1 });
+  return out;
+}
 
 export function introPose(t: number): Pose {
   const p = basePose();
   const d = walkDist(t);
   const wa = walkSpeed(t) / V0;
   p.x = X0 + d;
-  const ph = (d / 96) * Math.PI;
+  const ph = (d / HALF_STRIDE) * Math.PI;
   p.legPhase = ph;
   p.legAmp = wa;
   const sinp = Math.sin(ph);
@@ -134,7 +172,7 @@ export function introPose(t: number): Pose {
   p.antenna += 0.2 * dampedSin(t - 3.12, 2.8, 4);
   p.bulb = seg(t, 3.14, 3.34) * (1 - seg(t, 4.6, 5.0));
 
-  hop(p, t, 3.24, 3.36, 3.62, 34);
+  hop(p, t, HOPS.intro);
 
   // the network overtakes it: it shrinks away into the distance
   const k = seg(t, 3.7, 5.3, E.inOutCubic);
@@ -161,8 +199,8 @@ export function finalePose(t: number): Pose {
   p.smile = seg(t, 29.08, 29.22, E.outCubic);
   p.bulb = seg(t, 29.1, 29.3) * (1 - seg(t, 29.9, 30));
   p.bulbCol = hex('#9ED4FF');
-  hop(p, t, 29.14, 29.24, 29.52, 42);
-  p.tilt += 0.04 * bump(t, 29.24, 29.52);
+  hop(p, t, HOPS.finale);
+  p.tilt += 0.04 * bump(t, HOPS.finale.tUp, HOPS.finale.tLand);
   p.alpha = 1 - seg(t, 29.74, 30.0, E.inOutSine);
   return p;
 }

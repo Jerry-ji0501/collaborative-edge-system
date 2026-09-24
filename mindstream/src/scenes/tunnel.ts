@@ -1,7 +1,7 @@
 // Scene 08 — inside the horizon: a hand-inked tunnel of rings, dashes and beads we fly through.
 import { Ctx, boilOf, glow, wobbleCirclePath } from '../core/draw';
 import { RGB, hex, rgba } from '../core/color';
-import { E, TAU, clamp, lerp, mod, seg, smoothInt, smoothstep } from '../core/math';
+import { E, TAU, clamp, lerp, mod, reach, seg, smoothInt, smoothstep } from '../core/math';
 import { RNG } from '../core/rng';
 
 const F = 250;
@@ -47,6 +47,24 @@ export function tunnelZ(t: number): number {
   const d = t - T0;
   return 0.7 * d + 2.3 * (d - smoothInt(t, 22.1, 22.75));
 }
+/** Forward speed through the tunnel (z units / s): cruising at 3, braking to 0.7 as the light gathers. */
+export function tunnelSpeed(t: number): number {
+  return t < T0 ? 0 : 0.7 + 2.3 * (1 - smoothstep(22.1, 22.75, t));
+}
+
+/** When each ring rushes past the frame edge (its radius F/dz reaches ~1000px), for the wind gusts. */
+export function ringPasses(): { t: number; type: number; seed: number }[] {
+  const dz = F / 1000;
+  const last = 22.5; // from here the rings condense into the light instead of flying past
+  const out: { t: number; type: number; seed: number }[] = [];
+  for (const rg of rings) {
+    const z = rg.z - dz;
+    if (tunnelZ(last) < z) break;
+    out.push({ t: reach(tunnelZ, z, T0, last), type: rg.type, seed: rg.seed });
+  }
+  return out;
+}
+
 const axX = (z: number): number => 0.12 * Math.sin(0.8 * z);
 const axY = (z: number): number => 0.08 * Math.cos(0.6 * z + 1);
 

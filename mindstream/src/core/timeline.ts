@@ -24,6 +24,7 @@ export const K = {
   zoomIn: 26.9,
   land: 28.55,
   turn: 28.75,
+  bulb: 29.1,
   end: 30,
 };
 

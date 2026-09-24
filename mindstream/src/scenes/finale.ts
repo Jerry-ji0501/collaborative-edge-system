@@ -2,7 +2,7 @@
 import { Ctx, boilOf, softGlow, wobbleCirclePath } from '../core/draw';
 import { C, hex, rgba } from '../core/color';
 import { E, TAU, bump, dampedSin, lerp, seg } from '../core/math';
-import { Cam, applyCam } from '../core/camera';
+import { Cam, applyCam, toScreen } from '../core/camera';
 import { darkness } from '../core/timeline';
 import { GROUND_Y } from '../core/geometry';
 import { drawCharacter, drawGround, finalePose } from './character';
@@ -12,17 +12,41 @@ const D0 = { x: 585, y: 420 };
 const FINAL_C = { x: 705, y: 590 };
 const FINAL_Z = 1.35;
 const Z0 = 29 / DOT_R;
+const LAND = 28.55;
+/** After landing the orb rebounds as |damped sine|, meeting the ground every half period… */
+const REBOUND = { hz: 1.7, decay: 4.5, h: 16 };
+/** …then hops along with the creature. */
+const HOP = { a: 29.27, b: 29.5, h: 13 };
 
 function dotPos(t: number): [number, number] {
-  const tau = seg(t, 27.95, 28.55, E.inOutSine);
+  const tau = seg(t, 27.95, LAND, E.inOutSine);
   const x = D0.x + 16 * Math.sin(tau * Math.PI * 1.6) * (1 - tau);
   let y = lerp(D0.y, GROUND_Y - DOT_R - 1, tau);
-  y -= Math.abs(dampedSin(t - 28.55, 1.7, 4.5)) * 16;
-  y -= 13 * bump(t, 29.27, 29.5);
+  y -= Math.abs(dampedSin(t - LAND, REBOUND.hz, REBOUND.decay)) * REBOUND.h;
+  y -= HOP.h * bump(t, HOP.a, HOP.b);
   return [x, y];
 }
 
-function finaleCam(t: number): Cam {
+/** Each time the orb meets the ground: screen x (for panning) and a 0..1 loudness from the arc it ends. */
+export function dotTouchdowns(): { t: number; x: number; k: number }[] {
+  const out: { t: number; x: number; k: number }[] = [];
+  const at = (t: number, k: number): void => {
+    const [x, y] = dotPos(t);
+    out.push({ t, x: toScreen(finaleCam(t), x, y)[0], k });
+  };
+  const half = 1 / (2 * REBOUND.hz);
+  at(LAND, 1);
+  // every rebound arc is exp(-decay · half) lower than the last; impact speed goes with √height
+  for (let n = 1; ; n++) {
+    const k = Math.exp((-REBOUND.decay * half * n) / 2);
+    if (k < 0.2) break;
+    at(LAND + n * half, k);
+  }
+  at(HOP.b, 0.5);
+  return out;
+}
+
+export function finaleCam(t: number): Cam {
   const k = seg(t, 27.95, 28.85, E.inOutCubic);
   const [dx, dy] = dotPos(t);
   return { x: lerp(dx, FINAL_C.x, k), y: lerp(dy, FINAL_C.y, k), zoom: Z0 * Math.pow(FINAL_Z / Z0, k), rot: 0 };

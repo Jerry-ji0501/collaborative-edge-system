@@ -16,6 +16,9 @@ export function ringRot(i: number, t: number): number {
   const dir = i % 2 === 0 ? 1 : -1;
   return dir * (0.55 + 0.1 * i) * smoothInt(t, 9.9, 10.7);
 }
+/** The incoming white beam's front: 0 as it enters at the left edge → 1 as it strikes the prism (8.05s). */
+export const beamFront = (t: number): number => seg(t, 7.55, 8.05, E.inQuad);
+
 function ringSpan(i: number, t: number): number {
   const gap = 0.55 + 0.4 * hash01(i * 13 + 5);
   return lerp(TAU - gap, TAU + 0.03, seg(t, 10.45, 10.95, E.inOutSine));
@@ -96,7 +99,7 @@ export function drawPrismAct(ctx: Ctx, t: number): void {
   const beamOn = seg(t, 7.58, 7.72) * (1 - seg(t, 9.75, 10.4));
   if (beamOn > 0) {
     ctx.globalCompositeOperation = 'lighter';
-    const frontP = seg(t, 7.55, 8.05, E.inQuad);
+    const frontP = beamFront(t);
     const xf = lerp(-120, ENTRY.x, frontP);
     beamLine(ctx, -120, ENTRY.y, ENTRY.x, ENTRY.y, 0.35 * beamOn, 2.2);
     const flick = 1 + 0.06 * Math.sin(t * 37) * Math.sin(t * 13);
