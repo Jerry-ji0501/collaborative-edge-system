@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "collab-infer"
+version = "0.1.0"
+description = "A general collaborative inference framework for edge devices: tensor, pipeline and sequence parallelism"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+hf = ["transformers", "safetensors"]
+test = ["pytest"]
+
+[project.scripts]
+collab-infer = "collab_infer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["collab_infer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::UserWarning"]
