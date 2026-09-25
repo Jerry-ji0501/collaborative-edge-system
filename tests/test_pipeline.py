@@ -63,3 +63,26 @@ def _channel(rank, world):
 
 def test_channel_roundtrip_and_stop():
     assert run_dist(_channel, 2)[1] is True
+
+
+def _encoded_channel(rank, world, comm_dtype):
+    ctx = ParallelContext(world, 1, 1, comm_dtype=comm_dtype)
+    ch = P2PChannel(ctx.pp)
+    g = torch.Generator().manual_seed(0)
+    xs = [torch.randn(2, 5, 64, generator=g) * 3, torch.randn(3, 7, generator=g, dtype=torch.float64), torch.arange(6), torch.zeros(0, 4)]
+    if rank == 0:
+        ch.send(xs, 1)
+        ch.send(xs[0], 1, compress=False)
+        ch.flush()
+        return None
+    got, raw = ch.recv(0).tensors, ch.recv(0).tensor
+    errors = [float((a.double() - b.double()).abs().max() / max(b.double().abs().max().item(), 1e-12)) if b.numel() else 0.0 for a, b in zip(got, xs)]
+    same_meta = all(a.dtype == b.dtype and a.shape == b.shape for a, b in zip(got, xs))
+    return errors, same_meta, bool(torch.equal(got[2], xs[2])), bool(torch.equal(raw, xs[0]))
+
+
+@pytest.mark.parametrize("comm_dtype,tol", [("float16", 1e-3), ("bfloat16", 5e-3), ("int8", 1e-2)])
+def test_channel_compression_roundtrip(comm_dtype, tol):
+    errors, same_meta, ints_exact, raw_exact = run_dist(_encoded_channel, 2, comm_dtype)[1]
+    assert same_meta and ints_exact and raw_exact
+    assert max(errors) < tol

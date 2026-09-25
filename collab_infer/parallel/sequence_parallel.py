@@ -32,6 +32,7 @@ import torch
 from ..distributed.comm import Communicator
 from .attention import (
     KVMap,
+    attention,
     attention_with_lse,
     fully_masked,
     merge_attention,
@@ -97,8 +98,10 @@ def ring_attention(
     if len(kv_sizes) != n or kv_sizes[r] != k.shape[1]:
         raise ValueError(f"kv_sizes {list(kv_sizes)} inconsistent with local block of {k.shape[1]} tokens")
     B, _, Hkv, D = k.shape
-    kv = torch.stack([k, v]).contiguous()  # one message per step for K and V
-    pos = k_pos.contiguous()
+    # K and V travel as one message, optionally in a narrower dtype; the local
+    # block is used at full precision and received blocks are forwarded as-is
+    wire = comm.to_wire(torch.stack([k, v])).contiguous()
+    k_cur, v_cur, pos = k, v, k_pos.contiguous()
     out = lse = None
     nxt, prv = (r + 1) % n, (r - 1) % n
     for step in range(n):
@@ -106,21 +109,22 @@ def ring_attention(
         if step < n - 1:
             src = (r - step - 1) % n  # origin of the block arriving next
             pending = [
-                comm.isend(kv, nxt, tag=TAG_RING_KV),
+                comm.isend(wire, nxt, tag=TAG_RING_KV),
                 comm.isend(pos, nxt, tag=TAG_RING_POS),
-                comm.irecv((2, B, kv_sizes[src], Hkv, D), kv.dtype, prv, tag=TAG_RING_KV),
+                comm.irecv((2, B, kv_sizes[src], Hkv, D), wire.dtype, prv, tag=TAG_RING_KV),
                 comm.irecv((B, kv_sizes[src]), pos.dtype, prv, tag=TAG_RING_POS, emulate=False),
             ]
         if not fully_masked(q_pos, pos, causal):
             o, l = attention_with_lse(
-                q, kv[0], kv[1], q_pos, pos, causal=causal, scale=scale, kv_map=kv_map, kv_block=kv_block
+                q, k_cur, v_cur, q_pos, pos, causal=causal, scale=scale, kv_map=kv_map, kv_block=kv_block
             )
             out, lse = (o, l) if out is None else merge_attention(out, lse, o, l)
         if pending:
             pending[0].wait()
             pending[1].wait()
-            kv = pending[2].wait()
+            wire = pending[2].wait()
             pos = pending[3].wait()
+            k_cur, v_cur = wire[0].to(k.dtype), wire[1].to(k.dtype)
     if out is None:  # every key invisible (e.g. all padding)
         return torch.zeros_like(q)
     return out.to(q.dtype)
@@ -129,6 +133,67 @@ def ring_attention(
 # --------------------------------------------------------------------------
 # Ulysses (all-to-all) attention
 # --------------------------------------------------------------------------
+def _check_ulysses(comm: Communicator, seq_sizes: Sequence[int], head_shards: Sequence[HeadShard], s_local: int):
+    if len(seq_sizes) != comm.size or seq_sizes[comm.rank] != s_local:
+        raise ValueError(f"seq_sizes {list(seq_sizes)} inconsistent with local shard of {s_local} tokens")
+    if len(head_shards) != comm.size:
+        raise ValueError("need one head shard per rank")
+
+
+def ulysses_scatter(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    comm: Communicator,
+    seq_sizes: Sequence[int],
+    head_shards: Sequence[HeadShard],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """First Ulysses all-to-all: sequence-sharded -> head-sharded.
+
+    Takes local sequence shards ``[B, s_i, H(kv), D]`` with all heads and
+    returns this rank's heads over the whole sequence (tokens concatenated in
+    rank order) together with their positions ``[B, S]``.  Q, K and V travel
+    in a single all-to-all.
+    """
+    n, r = comm.size, comm.rank
+    B, s_local, _, D = q.shape
+    _check_ulysses(comm, seq_sizes, head_shards, s_local)
+    me = head_shards[r]
+    sends = [
+        torch.cat(
+            [
+                q[:, :, sh.q_start : sh.q_start + sh.q_count],
+                k[:, :, sh.kv_start : sh.kv_start + sh.kv_count],
+                v[:, :, sh.kv_start : sh.kv_start + sh.kv_count],
+            ],
+            dim=2,
+        ).contiguous()
+        for sh in head_shards
+    ]
+    width = me.q_count + 2 * me.kv_count
+    received = comm.all_to_all(sends, [(B, seq_sizes[j], width, D) for j in range(n)], compress=True)
+    full = torch.cat(received, dim=1) if n > 1 else received[0]
+    q_f, k_f, v_f = full.split([me.q_count, me.kv_count, me.kv_count], dim=2)
+    pos_f = comm.all_gather(positions, dim=1, sizes=seq_sizes)
+    return q_f, k_f, v_f, pos_f
+
+
+def ulysses_gather(
+    out_heads: torch.Tensor,
+    comm: Communicator,
+    seq_sizes: Sequence[int],
+    head_shards: Sequence[HeadShard],
+) -> torch.Tensor:
+    """Second Ulysses all-to-all: head-sharded ``[B, S, h_i, D]`` -> ``[B, s_i, H, D]``."""
+    n, r = comm.size, comm.rank
+    B, _, _, D = out_heads.shape
+    starts = offsets_of(seq_sizes)
+    sends = [out_heads[:, st : st + sz].contiguous() for st, sz in zip(starts, seq_sizes)]
+    back = comm.all_to_all(sends, [(B, seq_sizes[r], head_shards[j].q_count, D) for j in range(n)], compress=True)
+    return torch.cat(back, dim=2) if n > 1 else back[0]
+
+
 def ulysses_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,55 +218,24 @@ def ulysses_attention(
             (see :func:`~collab_infer.parallel.partition.partition_heads`).
         past: optional cached ``(k, v, pos)`` for this rank's heads over earlier
             tokens (``[B, T, kv_count, D]``), e.g. a previous prefill chunk.
+            (With a :class:`~collab_infer.models.cache.LayerKVCache`, prefer
+            :func:`ulysses_scatter` + append + attention + :func:`ulysses_gather`,
+            which avoids copying the cached history.)
 
     Returns:
         ``(out, (k_heads, v_heads, pos_full))`` where ``out`` is
         ``[B, s_i, Hq, D]`` and the second element holds this rank's heads over
         the full new sequence, ready to be appended to a head-sharded KV cache.
     """
-    n, r = comm.size, comm.rank
-    B, s_local, Hq, D = q.shape
-    if len(seq_sizes) != n or seq_sizes[r] != s_local:
-        raise ValueError(f"seq_sizes {list(seq_sizes)} inconsistent with local shard of {s_local} tokens")
-    if len(head_shards) != n:
-        raise ValueError("need one head shard per rank")
-    me = head_shards[r]
-
-    # 1) sequence-sharded -> head-sharded
-    sends = []
-    for sh in head_shards:
-        sends.append(
-            torch.cat(
-                [
-                    q[:, :, sh.q_start : sh.q_start + sh.q_count],
-                    k[:, :, sh.kv_start : sh.kv_start + sh.kv_count],
-                    v[:, :, sh.kv_start : sh.kv_start + sh.kv_count],
-                ],
-                dim=2,
-            ).contiguous()
-        )
-    width = me.q_count + 2 * me.kv_count
-    received = comm.all_to_all(sends, [(B, seq_sizes[j], width, D) for j in range(n)])
-    full = torch.cat(received, dim=1) if n > 1 else received[0]
-    q_f, k_f, v_f = full.split([me.q_count, me.kv_count, me.kv_count], dim=2)
-    pos_f = comm.all_gather(positions, dim=1, sizes=seq_sizes)
-
-    # 2) ordinary attention over the whole sequence for the local heads
+    me = head_shards[comm.rank]
+    q_f, k_f, v_f, pos_f = ulysses_scatter(q, k, v, positions, comm, seq_sizes, head_shards)
     k_att, v_att, p_att = k_f, v_f, pos_f
     if past is not None and past[0].shape[1] > 0:
         k_att = torch.cat([past[0], k_f], dim=1)
         v_att = torch.cat([past[1], v_f], dim=1)
         p_att = torch.cat([past[2], pos_f], dim=1)
-    o, _ = attention_with_lse(
-        q_f, k_att, v_att, pos_f, p_att, causal=causal, scale=scale, kv_map=me.kv_map, kv_block=kv_block
-    )
-    o = o.to(q.dtype)
-
-    # 3) head-sharded -> sequence-sharded
-    starts = offsets_of(seq_sizes)
-    sends = [o[:, st : st + sz].contiguous() for st, sz in zip(starts, seq_sizes)]
-    back = comm.all_to_all(sends, [(B, s_local, head_shards[j].q_count, D) for j in range(n)])
-    out = torch.cat(back, dim=2) if n > 1 else back[0]
+    o = attention(q_f, k_att, v_att, pos_f, p_att, causal=causal, scale=scale, kv_map=me.kv_map, kv_block=kv_block)
+    out = ulysses_gather(o, comm, seq_sizes, head_shards)
     return out, (k_f.contiguous(), v_f.contiguous(), pos_f)
 
 
@@ -253,4 +287,6 @@ __all__ = [
     "ring_attention",
     "shard_sequence",
     "ulysses_attention",
+    "ulysses_gather",
+    "ulysses_scatter",
 ]

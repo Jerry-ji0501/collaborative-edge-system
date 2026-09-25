@@ -40,6 +40,18 @@ _REDUCE_OPS = {
 
 # P2P tags used internally (user code may use any other tag).
 TAG_ALL_TO_ALL = 91
+TAG_SMALL_ALL_REDUCE = 92
+TAG_SMALL_ALL_GATHER = 93
+TAG_SMALL_BROADCAST = 94
+
+# Messages up to this size use a single direct exchange instead of gloo's
+# multi-step algorithms (~3x lower latency for decode-sized tensors).
+DEFAULT_SMALL_MESSAGE_BYTES = 64 * 1024
+
+_REDUCE_FNS = {"sum": torch.add, "max": torch.maximum, "min": torch.minimum, "prod": torch.mul}
+
+# activation compression on the wire (ParallelConfig.comm_dtype)
+COMM_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "int8": torch.bfloat16}
 
 
 def dist_ready() -> bool:
@@ -199,6 +211,14 @@ class Communicator:
             ``all_to_all``/``reduce_scatter`` (useful when the ranks of an
             edge cluster run different PyTorch builds).  Also enabled by the
             environment variable ``COLLAB_INFER_COMM_FALLBACK=1``.
+        small_message_bytes: with gloo, all-reduce/all-gather/broadcast of at
+            most this many bytes exchange data directly between all peers in
+            one hop (latency-bound decode traffic).  ``0`` disables it; the
+            default comes from ``COLLAB_INFER_SMALL_MSG_BYTES`` or 64 KiB.
+        comm_dtype: compress activations on the wire: ``"float16"``,
+            ``"bfloat16"`` or ``"int8"`` (int8 row-quantised point-to-point
+            activations, bfloat16 collectives).  Only calls that pass
+            ``compress=True`` (activation traffic) are affected.
     """
 
     def __init__(
@@ -211,6 +231,8 @@ class Communicator:
         stats: Optional[CommStats] = None,
         emulator: Optional[NetworkEmulator] = None,
         force_fallback: bool = False,
+        small_message_bytes: Optional[int] = None,
+        comm_dtype: Optional[str] = None,
     ) -> None:
         self.ranks = [int(r) for r in ranks]
         self.size = len(self.ranks)
@@ -230,6 +252,14 @@ class Communicator:
         self.emulator = emulator
         force_fallback = force_fallback or os.environ.get("COLLAB_INFER_COMM_FALLBACK", "0") == "1"
         self._native = {"all_to_all": not force_fallback, "reduce_scatter": not force_fallback}
+        if small_message_bytes is None:
+            small_message_bytes = int(os.environ.get("COLLAB_INFER_SMALL_MSG_BYTES", DEFAULT_SMALL_MESSAGE_BYTES))
+        # NCCL and MPI have their own low-latency protocols
+        self.small_message_bytes = small_message_bytes if self.backend == "gloo" else 0
+        if comm_dtype is not None and comm_dtype not in COMM_DTYPES:
+            raise ValueError(f"comm_dtype must be one of {sorted(COMM_DTYPES)}, got {comm_dtype!r}")
+        self.comm_dtype = comm_dtype
+        self.activation_dtype = COMM_DTYPES[comm_dtype] if comm_dtype else None
 
     # ------------------------------------------------------------- utilities
     def __repr__(self) -> str:
@@ -241,6 +271,23 @@ class Communicator:
     @property
     def is_trivial(self) -> bool:
         return self.size == 1
+
+    def to_wire(self, t: torch.Tensor) -> torch.Tensor:
+        """``t`` in its wire dtype; float16 saturates instead of overflowing to inf."""
+        wire = self.wire_dtype(t.dtype)
+        if wire == t.dtype:
+            return t
+        if wire == torch.float16:
+            t = t.clamp(-65504.0, 65504.0)
+        return t.to(wire)
+
+    def wire_dtype(self, dtype: torch.dtype) -> torch.dtype:
+        """Dtype activations of ``dtype`` travel in (narrower when compression is on)."""
+        wire = self.activation_dtype
+        if wire is None or not dtype.is_floating_point:
+            return dtype
+        itemsize = torch.empty(0, dtype=dtype).element_size()
+        return wire if torch.empty(0, dtype=wire).element_size() < itemsize else dtype
 
     def _to_comm(self, t: torch.Tensor) -> torch.Tensor:
         if t.device != self.comm_device:
@@ -259,6 +306,22 @@ class Communicator:
         self.stats.record(f"{self.name}.{op}", nbytes, time.perf_counter() - start)
         return result
 
+    def _exchange(self, buf: torch.Tensor, recv_shapes: Sequence[Sequence[int]], tag: int) -> List[torch.Tensor]:
+        """Send ``buf`` to every peer and receive one tensor from each (one hop)."""
+        parts: List[torch.Tensor] = []
+        works = []
+        for j in range(self.size):
+            if j == self.rank:
+                parts.append(buf)
+                continue
+            works.append(dist.isend(buf, self.ranks[j], group=self.group, tag=tag))
+            part = torch.empty(tuple(recv_shapes[j]), dtype=buf.dtype, device=buf.device)
+            works.append(dist.irecv(part, self.ranks[j], group=self.group, tag=tag))
+            parts.append(part)
+        for w in works:
+            w.wait()
+        return parts
+
     def _native_or_fallback(self, key: str, native: Callable[[], Any], fallback: Callable[[], Any]) -> Any:
         if self._native[key]:
             try:
@@ -273,31 +336,65 @@ class Communicator:
         return fallback()
 
     # ----------------------------------------------------------- collectives
-    def all_reduce(self, t: torch.Tensor, op: str = "sum") -> torch.Tensor:
-        """Reduce ``t`` over the group.  ``t`` may be modified in place."""
+    def all_reduce(self, t: torch.Tensor, op: str = "sum", compress: bool = False) -> torch.Tensor:
+        """Reduce ``t`` over the group.  ``t`` may be modified in place.
+
+        ``compress=True`` marks activation traffic that may travel in the
+        narrower ``comm_dtype``.
+        """
         if self.size == 1:
             return t
-        buf = self._to_comm(t)
+        buf = self._to_comm(self.to_wire(t) if compress else t)
         n = self.size
+        if _nbytes(buf) <= self.small_message_bytes:
+
+            def run_direct() -> torch.Tensor:
+                parts = self._exchange(buf, [buf.shape] * n, TAG_SMALL_ALL_REDUCE)
+                reduce_fn = _REDUCE_FNS[op]
+                out = parts[0].to(t.dtype)
+                for part in parts[1:]:  # fixed rank order: bitwise identical on every rank
+                    out = reduce_fn(out, part.to(t.dtype))
+                return out
+
+            out = self._timed("all_reduce", (n - 1) * _nbytes(buf), 1, run_direct)
+            return self._to(out, t.device)
 
         def run() -> torch.Tensor:
             dist.all_reduce(buf, op=_REDUCE_OPS[op], group=self.group)
             return buf
 
         out = self._timed("all_reduce", 2 * (n - 1) * _nbytes(buf) // n, 2 * (n - 1), run)
-        return self._to(out, t.device)
+        return self._to(out, t.device).to(t.dtype)
 
     def all_gather_list(
-        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None
+        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None, compress: bool = False
     ) -> List[torch.Tensor]:
         """Gather ``t`` from every rank; ``sizes[i]`` is rank ``i``'s extent along ``dim``."""
         if self.size == 1:
             return [t]
+        if compress and self.wire_dtype(t.dtype) != t.dtype:
+            parts = self.all_gather_list(self.to_wire(t), dim, sizes)
+            return [p.to(t.dtype) for p in parts]
         dim = dim % t.dim()
         sizes = [int(s) for s in sizes] if sizes is not None else [t.shape[dim]] * self.size
         if len(sizes) != self.size or sizes[self.rank] != t.shape[dim]:
             raise ValueError(f"all_gather sizes {sizes} inconsistent with local shape {tuple(t.shape)}")
         longest = max(sizes)
+        row_bytes = _nbytes(t) // max(1, t.shape[dim])
+        if longest * row_bytes <= self.small_message_bytes:
+            local = self._to_comm(t)
+            shapes = []
+            for s in sizes:
+                shape = list(t.shape)
+                shape[dim] = s
+                shapes.append(shape)
+            parts = self._timed(
+                "all_gather",
+                (self.size - 1) * _nbytes(local),
+                1,
+                lambda: self._exchange(local, shapes, TAG_SMALL_ALL_GATHER),
+            )
+            return [self._to(p, t.device) for p in parts]
         buf = t
         if t.shape[dim] < longest:  # gloo needs equal sizes: pad and trim
             pad_shape = list(t.shape)
@@ -313,19 +410,21 @@ class Communicator:
         return [self._to(o.narrow(dim, 0, s), t.device) for o, s in zip(outs, sizes)]
 
     def all_gather(
-        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None
+        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None, compress: bool = False
     ) -> torch.Tensor:
         """Concatenate ``t`` from all ranks along ``dim`` (uneven sizes allowed)."""
         if self.size == 1:
             return t
-        return torch.cat(self.all_gather_list(t, dim, sizes), dim=dim)
+        return torch.cat(self.all_gather_list(t, dim, sizes, compress=compress), dim=dim)
 
     def reduce_scatter(
-        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None
+        self, t: torch.Tensor, dim: int = 0, sizes: Optional[Sequence[int]] = None, compress: bool = False
     ) -> torch.Tensor:
         """Sum ``t`` over ranks and return this rank's chunk along ``dim``."""
         if self.size == 1:
             return t
+        if compress and self.wire_dtype(t.dtype) != t.dtype:
+            return self.reduce_scatter(self.to_wire(t), dim, sizes).to(t.dtype)
         dim = dim % t.dim()
         total = t.shape[dim]
         sizes = [int(s) for s in sizes] if sizes is not None else _even_split(total, self.size)
@@ -367,7 +466,10 @@ class Communicator:
         return self._to(out, t.device)
 
     def all_to_all(
-        self, inputs: Sequence[torch.Tensor], output_shapes: Sequence[Sequence[int]]
+        self,
+        inputs: Sequence[torch.Tensor],
+        output_shapes: Sequence[Sequence[int]],
+        compress: bool = False,
     ) -> List[torch.Tensor]:
         """Send ``inputs[j]`` to rank ``j``; receive tensors of ``output_shapes``.
 
@@ -378,6 +480,10 @@ class Communicator:
             raise ValueError("all_to_all needs one input and one output shape per rank")
         if self.size == 1:
             return [inputs[0]]
+        dtype = inputs[self.rank].dtype
+        if compress and self.wire_dtype(dtype) != dtype:
+            outs = self.all_to_all([self.to_wire(x) for x in inputs], output_shapes)
+            return [o.to(dtype) for o in outs]
         device = inputs[self.rank].device
         dtype = inputs[self.rank].dtype
         send = [self._to_comm(x) for x in inputs]
@@ -423,6 +529,22 @@ class Communicator:
             return t
         buf = self._to_comm(t)
         steps = max(1, (self.size - 1).bit_length())
+        if _nbytes(buf) <= self.small_message_bytes:
+
+            def run_direct() -> None:
+                if self.rank == src:
+                    works = [
+                        dist.isend(buf, self.ranks[j], group=self.group, tag=TAG_SMALL_BROADCAST)
+                        for j in range(self.size)
+                        if j != src
+                    ]
+                    for w in works:
+                        w.wait()
+                else:
+                    dist.recv(buf, self.ranks[src], group=self.group, tag=TAG_SMALL_BROADCAST)
+
+            self._timed("broadcast", _nbytes(buf), 1, run_direct)
+            return self._to(buf, t.device)
 
         def run() -> None:
             dist.broadcast(buf, src=self.ranks[src], group=self.group)

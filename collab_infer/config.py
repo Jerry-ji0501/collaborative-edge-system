@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 SP_MODES = ("ring", "ulysses")
 SP_LAYOUTS = ("contiguous", "zigzag")
+COMM_DTYPES = ("float16", "bfloat16", "int8")
 
 Weights = Sequence[float]
 
@@ -73,14 +74,30 @@ class ParallelConfig:
         megatron_sp: additionally apply Megatron-LM sequence parallelism inside
             each TP group (norms/residuals run on 1/tp of the tokens and the
             all-reduces become reduce-scatter + all-gather).
+        sp_decode_split: while decoding, let the SP ranks of a stage share
+            the MLP and attention output projection like extra TP ranks (they
+            already hold those weights) instead of all recomputing the whole
+            layer.  Lossless, but it adds one or two collectives per layer
+            (fused with the TP reductions when ``tp_size > 1``), so it only
+            pays off when decode compute dominates communication latency
+            (large models, fast links).  Off by default.
         tp_weights: relative capability of TP ranks; either one list shared by
             all stages or one list per pipeline stage.
         sp_weights: relative capability of SP ranks (uneven token split).
         pp_layers: number of decoder layers per pipeline stage.
         num_microbatches: micro-batches used to keep the pipeline busy.
             Defaults to ``pp_size``.
+        prefill_chunk: split prompts into chunks of this many tokens that flow
+            through the pipeline stages concurrently (lower time-to-first-token
+            when a single request occupies the pipeline).  ``None`` picks a
+            size automatically when ``pp_size > 1``; ``0`` disables chunking.
         attn_kv_block: if set, attention is computed in key blocks of this
             size (bounded memory for long contexts).
+        comm_dtype: lossy compression of activations on the network for
+            bandwidth-limited links: ``"float16"``/``"bfloat16"`` (half the
+            bytes of float32) or ``"int8"`` (row-quantised pipeline
+            activations, bfloat16 collectives).  ``None`` sends activations
+            unmodified.
         network: optional emulated network characteristics.
     """
 
@@ -90,11 +107,14 @@ class ParallelConfig:
     sp_mode: str = "ring"
     sp_layout: str = "contiguous"
     megatron_sp: bool = False
+    sp_decode_split: bool = False
     tp_weights: Optional[Union[Weights, Sequence[Weights]]] = None
     sp_weights: Optional[Weights] = None
     pp_layers: Optional[Sequence[int]] = None
     num_microbatches: Optional[int] = None
+    prefill_chunk: Optional[int] = None
     attn_kv_block: Optional[int] = None
+    comm_dtype: Optional[str] = None
     network: Optional[NetworkConfig] = None
 
     @property
@@ -134,8 +154,12 @@ class ParallelConfig:
             raise ValueError(f"cannot split {num_layers} layers into {self.pp_size} stages")
         if self.num_microbatches is not None and self.num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
+        if self.prefill_chunk is not None and self.prefill_chunk < 0:
+            raise ValueError("prefill_chunk must be >= 0")
         if self.attn_kv_block is not None and self.attn_kv_block < 1:
             raise ValueError("attn_kv_block must be >= 1")
+        if self.comm_dtype is not None and self.comm_dtype not in COMM_DTYPES:
+            raise ValueError(f"comm_dtype must be one of {COMM_DTYPES}, got {self.comm_dtype!r}")
         return self
 
     # ----------------------------------------------------------------- helpers
@@ -155,6 +179,12 @@ class ParallelConfig:
                 parts.append(f"layout={self.sp_layout}")
         if self.megatron_sp and self.tp_size > 1:
             parts.append("megatron_sp")
+        if self.comm_dtype:
+            parts.append(f"comm_dtype={self.comm_dtype}")
+        if self.prefill_chunk is not None:
+            parts.append(f"prefill_chunk={self.prefill_chunk}")
+        if self.sp_decode_split and self.sp_size > 1:
+            parts.append("sp_decode_split")
         if self.tp_weights is not None:
             parts.append(f"tp_weights={self.tp_weights}")
         if self.sp_weights is not None:
@@ -185,5 +215,5 @@ def _check_weights(weights: Weights, expected: int, name: str) -> None:
         raise ValueError(f"{name} entries must be positive, got {list(weights)}")
 
 
-__all__ = ["NetworkConfig", "ParallelConfig", "SP_LAYOUTS", "SP_MODES"]
+__all__ = ["COMM_DTYPES", "NetworkConfig", "ParallelConfig", "SP_LAYOUTS", "SP_MODES"]
 

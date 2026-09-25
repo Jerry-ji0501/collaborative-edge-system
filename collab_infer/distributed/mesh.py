@@ -38,6 +38,8 @@ class ParallelContext:
         device: Optional[torch.device] = None,
         network: Optional[NetworkConfig] = None,
         force_comm_fallback: bool = False,
+        small_message_bytes: Optional[int] = None,
+        comm_dtype: Optional[str] = None,
     ) -> None:
         self.pp_size, self.sp_size, self.tp_size = int(pp_size), int(sp_size), int(tp_size)
         expected = self.pp_size * self.sp_size * self.tp_size
@@ -55,6 +57,8 @@ class ParallelContext:
         self.stats = CommStats()
         self.emulator = NetworkEmulator.from_config(network)
         self._force_fallback = force_comm_fallback
+        self._small_message_bytes = small_message_bytes
+        self._comm_dtype = comm_dtype
 
         pp, sp, tp = self.pp_size, self.sp_size, self.tp_size
         # new_group must be called by every rank for every group, in the same order
@@ -77,6 +81,7 @@ class ParallelContext:
             config.tp_size,
             device=device,
             network=config.network,
+            comm_dtype=config.comm_dtype,
             **kwargs,
         )
 
@@ -90,6 +95,8 @@ class ParallelContext:
             stats=self.stats,
             emulator=self.emulator,
             force_fallback=self._force_fallback,
+            small_message_bytes=self._small_message_bytes,
+            comm_dtype=self._comm_dtype,
         )
 
     def _build(self, name: str, all_groups: Sequence[List[int]]) -> Communicator:

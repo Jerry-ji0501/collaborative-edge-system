@@ -61,11 +61,14 @@ def _parallel_config(args: argparse.Namespace) -> ParallelConfig:
         sp_mode=args.sp_mode,
         sp_layout=args.sp_layout,
         megatron_sp=args.megatron_sp,
+        sp_decode_split=args.sp_decode_split,
         tp_weights=_tp_weights(args.tp_weights),
         sp_weights=_floats(args.sp_weights),
         pp_layers=_ints(args.pp_layers),
         num_microbatches=args.microbatches,
+        prefill_chunk=args.prefill_chunk,
         attn_kv_block=args.kv_block,
+        comm_dtype=args.comm_dtype,
         network=network,
     )
 
@@ -228,6 +231,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--sp-mode", default="ring", choices=["ring", "ulysses"])
     g.add_argument("--sp-layout", default="contiguous", choices=["contiguous", "zigzag"])
     g.add_argument("--megatron-sp", action="store_true", help="Megatron sequence parallelism inside TP groups")
+    g.add_argument(
+        "--sp-decode-split", action="store_true", help="SP ranks share each layer's work while decoding"
+    )
+    g.add_argument("--prefill-chunk", type=int, help="tokens per pipelined prefill chunk (0 = off, default auto)")
+    g.add_argument(
+        "--comm-dtype", choices=["float16", "bfloat16", "int8"], help="lossy compression of activations on the network"
+    )
     g.add_argument("--tp-weights", help="e.g. '2,1' or per stage '2,1;1,1'")
     g.add_argument("--sp-weights", help="e.g. '3,1'")
     g.add_argument("--pp-layers", help="layers per stage, e.g. '10,12'")
