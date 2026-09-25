@@ -243,26 +243,26 @@ out = ring_attention(q, k, v, q_pos, k_pos, ctx.sp, layout.sizes, causal=False)
 
 ```
 strategy         TTFT s  decode tok/s  total s  max sent MB  max KV MB  max param MB
-TP4               0.142          33.8    1.031        14.35       1.11          6.87
-PP4               0.124         116.1    0.382         0.57       1.11          7.90
-SP4-ring          0.114          54.5    0.664         3.93       1.11         27.41
-SP4-ulysses       0.140          60.7    0.634         2.57       1.11         27.41
-PP2xTP2           0.120          41.2    0.849         5.57       1.11          6.86
-SP2xTP2           0.127          37.1    0.935         6.30       1.11         13.71
-PP2xSP2           0.090          62.5    0.570         1.49       1.11         13.71
+TP4               0.168          51.5    0.751        14.94       1.11          6.87
+PP4               0.067         114.3    0.329         0.57       1.11          7.90
+SP4-ring          0.110          55.0    0.655         3.93       1.11         27.41
+SP4-ulysses       0.124          65.8    0.580         2.57       1.11         27.41
+PP2xTP2           0.148          56.3    0.681         5.57       1.11          6.86
+SP2xTP2           0.125          45.1    0.790         6.17       1.11         13.71
+PP2xSP2           0.062          57.7    0.582         1.49       1.11         13.71
 ```
 
 模拟 100 Mbps / 5 ms 的 Wi‑Fi：
 
 ```
 strategy         TTFT s  decode tok/s  total s  max sent MB  max KV MB  max param MB
-TP4               1.700           3.6   10.150        14.35       1.11          6.87
-PP4               0.219          52.3    0.792         0.57       1.11          7.90
-SP4-ring          0.452          12.7    2.809         3.93       1.11         27.41
-SP4-ulysses       0.512          13.4    2.757         2.57       1.11         27.41
-PP2xTP2           0.665           8.5    4.187         5.57       1.11          6.86
-SP2xTP2           0.740           7.7    4.642         6.30       1.11         13.71
-PP2xSP2           0.200          24.6    1.421         1.49       1.11         13.71
+TP4               1.659          17.2    3.405        14.94       1.11          6.87
+PP4               0.135          49.4    0.742         0.57       1.11          7.90
+SP4-ring          0.444          28.4    1.500         3.93       1.11         27.41
+SP4-ulysses       0.380          31.3    1.339         2.57       1.11         27.41
+PP2xTP2           0.826          14.9    2.845         5.57       1.11          6.86
+SP2xTP2           0.722          12.7    3.082         6.17       1.11         13.71
+PP2xSP2           0.210          23.4    1.494         1.49       1.11         13.71
 ```
 
 可以看到边缘场景的典型取舍：TP 每层两次集合通信，对时延和带宽最敏感；PP 通信量最小，在弱网下最稳健；SP 把 KV Cache 均分到各设备（此处每设备 1/4），但权重在 SP 组内是复制的（param MB 更大），因此通常与 TP/PP 组合使用。
@@ -296,7 +296,7 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 | 注意力融合内核 | 使用 PyTorch SDPA / CPU flash kernel；位置允许时不构造掩码，GQA 不复制 K/V | 1024 token 时注意力快 11–23 倍；单设备 prefill 中注意力占比从约 60% 降到约 16% |
 | KV Cache 按 head 连续存储 | 缓存存为 `[B, H, T, D]`，对外仍是 token-major 视图 | 解码读取缓存无需拷贝，长上下文解码注意力约快 30% |
 | 融合投影 | Q/K/V、gate/up 各合成一次 GEMM；RoPE 每次前向只算一次 | prefill 的投影 GEMM 快 6–22% |
-| 小消息直接交换 | ≤64 KiB 的 all-reduce / all-gather / broadcast 一跳直接交换，按 rank 顺序求和 | 解码时的集合通信延迟约降到 1/3，结果逐位一致 |
+| 小消息直接交换 | ≤64 KiB 的 all-reduce / all-gather / broadcast 一跳直接交换，按 rank 顺序求和 | 解码时的集合通信延迟约降到 1/3，结果逐位一致；代价是多于 2 个 rank 时 all-reduce 发送的字节更多（4 个 rank 时约为 ring 的 2 倍） |
 | SP 解码拆分（`sp_decode_split`，可选，默认关闭） | 解码时 SP 各 rank 分担 MLP 和注意力输出投影，TP 与 SP 的归约合并为一次 stage 级 all-reduce | 减少重复计算，但每层多 1–2 次集合通信：本机回环下 Ulysses 解码约快 10–30%，模拟 100 Mbps/5 ms 链路下反而慢 1.35–2.2 倍，因此默认关闭 |
 | 词表并行采样 | LM head 按词表切到整个 stage，只交换少量候选；计数器噪声的 Gumbel-max 采样 | 每个 token 不再收集完整词表 logits；采样结果与并行方式无关 |
 | 分块流水 prefill（`prefill_chunk`） | prompt 分块依次流过各 stage，后面的块使用前面块的 KV Cache | 单请求时各 stage 同时工作，降低首 token 时延 |
@@ -342,7 +342,7 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 - **自描述的流水线通道。** `P2PChannel` 的每条消息带一个固定大小的头（消息类型、dtype、shape），stage 之间无需预先知道激活形状；`STOP` 控制消息随数据流传递，用于提前结束已生成完毕（EOS）的 micro-batch。生成时，最后一个 stage 采样后把 token 送回第一个 stage，多个 micro-batch 在流水线中交错，使所有 stage 保持忙碌。
 - **词表并行采样。** LM head 在最后一个 stage 的所有 rank 上按词表切分，每个 rank 只提出少量候选，一次很小的 all-gather 后所有 rank 用纯比较得出相同的 token（贪心、温度采样、top-k），不需要收集完整词表的 logits，也不需要再广播；top-p 由一个 rank 决定后广播，候选不足以覆盖 nucleus 时自动退回完整词表，保证精确。随机采样使用 Gumbel-max 与按 `(seed, 序列, 步数, token)` 计算的计数器噪声，因此采样结果与并行方式和 micro-batch 划分无关，且即使异构硬件的 logits 有细微差别，各 rank 的结果也严格一致。
 - **后端兼容。** gloo 在一些版本中不支持非均匀的 all-gather / all-to-all（本仓库在 torch 2.14 上实测）：all-gather 采用补齐后裁剪的方式，all-to-all 采用 `all_to_all_single` 的非均匀 split，不支持时自动回退到点对点实现。
-- **小消息直接交换。** gloo 的 all-reduce 对解码阶段的小张量需要多步往返；不超过 64 KiB 的 all-reduce / all-gather / broadcast 改为所有 rank 一跳直接交换（实测延迟约为原来的 1/3），all-reduce 按固定 rank 顺序求和，结果在所有 rank 上逐位相同。
+- **小消息直接交换。** gloo 的 all-reduce 对解码阶段的小张量需要多步往返；不超过 64 KiB 的 all-reduce / all-gather / broadcast 改为所有 rank 一跳直接交换（实测延迟约为原来的 1/3），all-reduce 按固定 rank 顺序求和，结果在所有 rank 上逐位相同。代价是多于 2 个 rank 时 all-reduce 的发送字节更多（每个 rank 把整个张量直接发给其余 N−1 个 rank，4 个 rank 时约为 ring 算法的 2 倍），但这些消息很小，主要开销是时延；阈值可通过环境变量 `COLLAB_INFER_SMALL_MSG_BYTES` 或 `ParallelContext(small_message_bytes=...)` 调整，设为 0 即关闭。
 - **注意力内核。** 注意力交给 PyTorch 的融合算子（SDPA；需要 LSE 时使用 CPU flash kernel）。位置允许时不构造掩码（无 padding 的 prefill 用 `is_causal`，解码时所有缓存的 key 都可见则不需要掩码），GQA 不复制 K/V，需要掩码时按 query 分块以限制内存；KV Cache 按 head 连续存储。
 
 ---
