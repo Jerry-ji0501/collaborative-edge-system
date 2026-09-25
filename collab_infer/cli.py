@@ -61,7 +61,7 @@ def _parallel_config(args: argparse.Namespace) -> ParallelConfig:
         sp_mode=args.sp_mode,
         sp_layout=args.sp_layout,
         megatron_sp=args.megatron_sp,
-        sp_decode_split=not args.no_sp_decode_split,
+        sp_decode_split=args.sp_decode_split,
         tp_weights=_tp_weights(args.tp_weights),
         sp_weights=_floats(args.sp_weights),
         pp_layers=_ints(args.pp_layers),
@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--sp-layout", default="contiguous", choices=["contiguous", "zigzag"])
     g.add_argument("--megatron-sp", action="store_true", help="Megatron sequence parallelism inside TP groups")
     g.add_argument(
-        "--no-sp-decode-split", action="store_true", help="SP ranks recompute whole layers while decoding (slower)"
+        "--sp-decode-split", action="store_true", help="SP ranks share each layer's work while decoding"
     )
     g.add_argument("--prefill-chunk", type=int, help="tokens per pipelined prefill chunk (0 = off, default auto)")
     g.add_argument(

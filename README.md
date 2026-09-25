@@ -10,7 +10,7 @@
 
 三者构成一个 `pp × sp × tp` 的 3D 设备网格，可以任意组合（如 `pp=2, sp=2, tp=2` 共 8 台设备）。所有维度都支持**按设备能力的非均匀切分**（异构边缘集群），并提供**自动规划器**、**网络模拟器**和**通信统计**。
 
-> 正确性：测试套件在 float64 下将 31 种并行配置（含所有组合、非均匀切分、zigzag、Megatron-SP、GQA/MQA、padding、分块流水 prefill、EOS、采样）与一个独立实现的单设备参考模型逐 logit 比较（误差 ~1e-16），并与 Hugging Face `transformers` 的 LLaMA / Qwen2 实现对齐（float32 误差 ~2e-7）。
+> 正确性：测试套件在 float64 下将 37 种并行配置（含所有组合、非均匀切分、zigzag、Megatron-SP、GQA/MQA、padding、分块流水 prefill、SP 解码拆分、EOS、采样）与一个独立实现的单设备参考模型逐 logit 比较（误差 ~1e-16），并与 Hugging Face `transformers` 的 LLaMA / Qwen2 实现对齐（float32 误差 ~2e-7）。
 
 ---
 
@@ -278,18 +278,18 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 | single (4 threads) | 1376 → **701 ms**（2.0×） | 51.1 → **26.1**（2.0×） | 0.00 → 0.00 |
 | TP2 | 1479 → **744 ms**（2.0×） | 92.8 → **42.7**（2.2×） | 73.51 → 72.42 |
 | PP2 | 2525 → **1064 ms**（2.4×） | 75.7 → **52.1**（1.5×） | 4.27 → 4.27 |
-| SP2 ring | 1182 → **819 ms**（1.4×） | 85.9 → **54.5**（1.6×） | 8.96 → 10.01 |
-| SP2 ulysses | 1380 → **806 ms**（1.7×） | 77.7 → **45.4**（1.7×） | 21.27 → 22.06 |
+| SP2 ring | 1182 → **743 ms**（1.6×） | 85.9 → **53.0**（1.6×） | 8.96 → 8.96 |
+| SP2 ulysses | 1380 → **816 ms**（1.7×） | 77.7 → **59.6**（1.3×） | 21.27 → 21.27 |
 | PP4 (1 thread each) | 4769 → **1102 ms**（4.3×） | 125.5 → **76.5**（1.6×） | 4.27 → 4.27 |
 | TP2 @100Mbps/2ms | 7182 → **6597 ms**（1.1×） | 154.6 → **79.9**（1.9×） | 73.51 → 72.42 |
 | PP2 @100Mbps/2ms | 2951 → **1111 ms**（2.7×） | 78.3 → **55.3**（1.4×） | 4.27 → 4.27 |
-| SP2 ulysses @100Mbps/2ms | 3240 → **2488 ms**（1.3×） | 87.8 → **85.6**（1.0×） | 21.27 → 22.06 |
+| SP2 ulysses @100Mbps/2ms | 3240 → **2529 ms**（1.3×） | 87.8 → **72.1**（1.2×） | 21.27 → 21.27 |
 | TP2 @100Mbps/2ms +fp16（新增选项） | 7182 → **3764 ms**（1.9×） | 154.6 → **78.9**（2.0×） | 73.51 → 36.21 |
-| SP2 ulysses @100Mbps/2ms +fp16（新增选项） | 3240 → **1812 ms**（1.8×） | 87.8 → **79.6**（1.1×） | 21.27 → 11.05 |
+| SP2 ulysses @100Mbps/2ms +fp16（新增选项） | 3240 → **1695 ms**（1.9×） | 87.8 → **72.5**（1.2×） | 21.27 → 10.79 |
 
-几点说明：TP2 在模拟链路上的 prefill 受带宽限制（每次生成约 72 MB 的 all-reduce 流量），不压缩时首 token 只快 1.1 倍，开启 `comm_dtype="float16"` 后快 1.9 倍；SP 的解码拆分用 stage 级 all-reduce 代替了重复计算，因此发送字节略有增加（约 5–10%），但整体更快；PP4 的首 token 时延主要得益于分块流水 prefill。
+几点说明：TP2 在模拟链路上的 prefill 受带宽限制（每次生成约 72 MB 的 all-reduce 流量），不压缩时首 token 只快 1.1 倍，开启 `comm_dtype="float16"` 后快 1.9 倍；PP4 的首 token 时延主要得益于分块流水 prefill。
 
-各项优化（默认开启的都是无损的）：
+各项优化（除通信压缩外都是无损的）：
 
 | 优化 | 做法 | 效果 |
 | --- | --- | --- |
@@ -297,7 +297,7 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 | KV Cache 按 head 连续存储 | 缓存存为 `[B, H, T, D]`，对外仍是 token-major 视图 | 解码读取缓存无需拷贝，长上下文解码注意力约快 30% |
 | 融合投影 | Q/K/V、gate/up 各合成一次 GEMM；RoPE 每次前向只算一次 | prefill 的投影 GEMM 快 6–22% |
 | 小消息直接交换 | ≤64 KiB 的 all-reduce / all-gather / broadcast 一跳直接交换，按 rank 顺序求和 | 解码时的集合通信延迟约降到 1/3，结果逐位一致 |
-| SP 解码拆分（`sp_decode_split`） | 解码时 SP 各 rank 分担 MLP、输出投影和 LM head，TP 与 SP 的归约合并为一次 stage 级 all-reduce | SP 解码不再每个 rank 重复计算整层 |
+| SP 解码拆分（`sp_decode_split`，可选，默认关闭） | 解码时 SP 各 rank 分担 MLP 和注意力输出投影，TP 与 SP 的归约合并为一次 stage 级 all-reduce | 减少重复计算，但每层多 1–2 次集合通信：本机回环下 Ulysses 解码约快 10–30%，模拟 100 Mbps/5 ms 链路下反而慢 1.35–2.2 倍，因此默认关闭 |
 | 词表并行采样 | LM head 按词表切到整个 stage，只交换少量候选；计数器噪声的 Gumbel-max 采样 | 每个 token 不再收集完整词表 logits；采样结果与并行方式无关 |
 | 分块流水 prefill（`prefill_chunk`） | prompt 分块依次流过各 stage，后面的块使用前面块的 KV Cache | 单请求时各 stage 同时工作，降低首 token 时延 |
 | 激活通信压缩（`comm_dtype`，可选，有损） | TP/SP 集合通信与流水线激活以 float16 / bfloat16 传输，或流水线激活按行 int8 量化 | 通信字节减半（int8 流水线为 1/4），弱网下首 token 时延明显下降 |
@@ -305,6 +305,7 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 使用建议：
 
 - **通信压缩**优先用 `comm_dtype="float16"`（10 位尾数，超出范围时饱和而不是溢出）。在标准初始化（std 0.02）的随机模型上，float16 的 logits 相对误差 ≤7e-4，bfloat16 ≤6e-3，int8 流水线 ≤8e-3，生成的 16 个 token 全部一致；但在初始化更大（std 0.05）、扰动会逐层放大的随机模型上，bfloat16 / int8 会明显改变输出。请在目标模型上验证 bfloat16 / int8 的精度后再使用。
+- **SP 解码拆分**默认关闭：它用额外的集合通信换取更少的重复计算。在高延迟的边缘链路上通信代价更高；在低延迟链路上、模型较大或 Ulysses 模式时可以开启（`sp_decode_split=True` / `--sp-decode-split`）并实测对比。
 - **分块流水 prefill** 在 `pp_size > 1` 时默认开启（每个 stage 约 2 块，至少 128 token）。实测单请求时 PP4 首 token 时延快约 1.9 倍；在一台机器上模拟多设备时，各进程共享内存带宽，收益会小于真实的多设备部署。
 - **OpenMP 线程等待策略**：`launch_local` 模拟多设备时默认设置 `OMP_WAIT_POLICY=PASSIVE`，避免空转的计算线程抢占通信线程（实测 TP2 解码约快 20%）；但它会让单进程的小算子唤醒变慢。在真实设备上可以两种都测一下。
 - **权重精度**：本仓库测试的 x86 CPU 没有原生 bf16 指令，PyTorch 的 int8 权重算子比 fp32 慢 4.6–58 倍，因此没有提供 int8 权重量化；`dtype=torch.bfloat16` 解码约快 1.4 倍、内存减半，但 prefill 约慢 4 倍。在带原生 bf16/int8 指令的设备上结论可能不同。
@@ -326,7 +327,7 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 | `pp_layers` | `None` | 每个 stage 的层数（默认均分） |
 | `num_microbatches` | `pp_size` | 流水线 micro-batch 数 |
 | `prefill_chunk` | 自动 | 把 prompt 切成若干块在流水线各 stage 间并行流动（降低单请求首 token 时延）；`None` 在 `pp_size > 1` 时自动选择块大小，`0` 关闭 |
-| `sp_decode_split` | `True` | 解码时 SP 各 rank 分担 MLP、注意力输出投影和 LM head，而不是各自重复计算整层（无损） |
+| `sp_decode_split` | `False` | 解码时 SP 各 rank 分担 MLP 和注意力输出投影，而不是各自重复计算整层（无损，但每层多 1–2 次集合通信；只在解码计算明显多于通信延迟时开启，例如模型较大、链路很快） |
 | `comm_dtype` | `None` | 有损的激活通信压缩：`"float16"` / `"bfloat16"`（字节减半），`"int8"`（流水线激活按行 int8 量化，集合通信用 bfloat16） |
 | `attn_kv_block` | `None` | 注意力按 key 分块计算，限制长序列的峰值内存 |
 | `network` | `None` | `NetworkConfig(bandwidth_mbps, latency_ms)` 网络模拟 |

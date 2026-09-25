@@ -48,9 +48,15 @@ CASES = [
     ("pp2_sp2_tp2_ring_megatron", dict(pp_size=2, sp_size=2, tp_size=2, sp_layout="zigzag", megatron_sp=True), {}),
     ("pp2_sp2_tp2_ulysses", dict(pp_size=2, sp_size=2, tp_size=2, sp_mode="ulysses"), {}),
     ("pp2_tp2_biases_tied", dict(pp_size=2, tp_size=2), dict(qkv_bias=True, o_bias=True, mlp_bias=True, tie_word_embeddings=True)),
-    # SP decoding without splitting the dense compute across SP ranks
-    ("sp2_ring_no_decode_split", dict(sp_size=2, sp_decode_split=False), {}),
-    ("sp2_ulysses_no_decode_split", dict(sp_size=2, sp_mode="ulysses", sp_decode_split=False), {}),
+    # SP ranks share the dense compute of each layer while decoding (opt-in)
+    ("sp2_ring_decode_split", dict(sp_size=2, sp_decode_split=True), {}),
+    ("sp2_ulysses_decode_split", dict(sp_size=2, sp_mode="ulysses", sp_decode_split=True), {}),
+    ("sp3_ring_short_prompts_decode_split", dict(sp_size=3, num_microbatches=4, sp_decode_split=True), {}),
+    ("sp2_ulysses_mqa_decode_split", dict(sp_size=2, sp_mode="ulysses", sp_decode_split=True), dict(num_kv_heads=1)),
+    ("tp2_sp2_ring_decode_split", dict(tp_size=2, sp_size=2, sp_decode_split=True), {}),
+    ("tp3_sp2_ulysses_decode_split", dict(tp_size=3, sp_size=2, sp_mode="ulysses", sp_decode_split=True), dict(num_kv_heads=2)),
+    ("pp2_sp2_tp2_decode_split", dict(pp_size=2, sp_size=2, tp_size=2, sp_layout="zigzag", sp_decode_split=True), {}),
+    ("sp4_heads_lt_ranks_decode_split", dict(sp_size=4, sp_decode_split=True), dict(num_heads=2, num_kv_heads=1, head_dim=32)),
     # chunked (pipelined) prefill: later chunks attend to the cache of earlier ones
     ("single_chunked_prefill", dict(prefill_chunk=4), {}),
     ("pp2_chunked_prefill", dict(pp_size=2, prefill_chunk=3), {}),

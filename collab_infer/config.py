@@ -74,11 +74,13 @@ class ParallelConfig:
         megatron_sp: additionally apply Megatron-LM sequence parallelism inside
             each TP group (norms/residuals run on 1/tp of the tokens and the
             all-reduces become reduce-scatter + all-gather).
-        sp_decode_split: while decoding, the SP ranks of a stage share the
-            MLP, attention output projection and LM head like extra TP ranks
-            (they already hold those weights), instead of all recomputing the
-            whole layer.  Lossless; the TP and SP reductions are fused into
-            one collective over the stage.
+        sp_decode_split: while decoding, let the SP ranks of a stage share
+            the MLP and attention output projection like extra TP ranks (they
+            already hold those weights) instead of all recomputing the whole
+            layer.  Lossless, but it adds one or two collectives per layer
+            (fused with the TP reductions when ``tp_size > 1``), so it only
+            pays off when decode compute dominates communication latency
+            (large models, fast links).  Off by default.
         tp_weights: relative capability of TP ranks; either one list shared by
             all stages or one list per pipeline stage.
         sp_weights: relative capability of SP ranks (uneven token split).
@@ -105,7 +107,7 @@ class ParallelConfig:
     sp_mode: str = "ring"
     sp_layout: str = "contiguous"
     megatron_sp: bool = False
-    sp_decode_split: bool = True
+    sp_decode_split: bool = False
     tp_weights: Optional[Union[Weights, Sequence[Weights]]] = None
     sp_weights: Optional[Weights] = None
     pp_layers: Optional[Sequence[int]] = None
@@ -181,8 +183,8 @@ class ParallelConfig:
             parts.append(f"comm_dtype={self.comm_dtype}")
         if self.prefill_chunk is not None:
             parts.append(f"prefill_chunk={self.prefill_chunk}")
-        if not self.sp_decode_split and self.sp_size > 1:
-            parts.append("no_sp_decode_split")
+        if self.sp_decode_split and self.sp_size > 1:
+            parts.append("sp_decode_split")
         if self.tp_weights is not None:
             parts.append(f"tp_weights={self.tp_weights}")
         if self.sp_weights is not None:
