@@ -11,6 +11,7 @@ traffic, which illustrates the trade-offs:
 
     python examples/benchmark_strategies.py --world 4 --prompt-len 256
     python examples/benchmark_strategies.py --bandwidth-mbps 100 --latency-ms 5
+    python examples/benchmark_strategies.py --bandwidth-mbps 100 --latency-ms 5 --comm-dtype float16
 """
 
 import argparse
@@ -68,7 +69,10 @@ def main() -> None:
     parser.add_argument("--bandwidth-mbps", type=float)
     parser.add_argument("--latency-ms", type=float, default=0.0)
     parser.add_argument("--only", help="comma separated strategy labels to run")
+    parser.add_argument("--comm-dtype", choices=["float16", "bfloat16", "int8"], help="compress activation traffic")
+    parser.add_argument("--prefill-chunk", type=int, help="pipelined prefill chunk size (0 = off, default auto)")
     args = parser.parse_args()
+    extra = {k: v for k, v in (("comm_dtype", args.comm_dtype), ("prefill_chunk", args.prefill_chunk)) if v is not None}
 
     model = dict(vocab_size=2048, hidden_size=256, intermediate_size=688, num_layers=8, num_heads=8, num_kv_heads=4)
     network = None
@@ -76,14 +80,14 @@ def main() -> None:
         network = dict(bandwidth_mbps=args.bandwidth_mbps, latency_ms=args.latency_ms)
     workload = dict(batch=args.batch, prompt_len=args.prompt_len, new_tokens=args.new_tokens)
     net = f"{args.bandwidth_mbps or 'unlimited'} Mbps / {args.latency_ms} ms" if network else "no emulation"
-    print(f"model {model}\nworkload {workload}, network: {net}\n")
+    print(f"model {model}\nworkload {workload}, network: {net}, options: {extra or 'defaults'}\n")
     print(f"{'strategy':<14}{'TTFT s':>9}{'decode tok/s':>14}{'total s':>9}{'max sent MB':>13}{'max KV MB':>11}{'max param MB':>14}")
     baseline = None
     selected = set(args.only.split(",")) if args.only else None
     for label, parallel in strategies(args.world):
         if selected and label not in selected:
             continue
-        rows = launch_local(worker, args.world, args=(model, parallel, network, workload), return_results=True)
+        rows = launch_local(worker, args.world, args=(model, {**parallel, **extra}, network, workload), return_results=True)
         s = rows[0]["stats"]
         baseline = baseline or rows[0]["tokens"]
         same = "" if rows[0]["tokens"] == baseline else "  (tokens differ!)"

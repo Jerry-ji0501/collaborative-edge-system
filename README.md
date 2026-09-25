@@ -10,7 +10,7 @@
 
 三者构成一个 `pp × sp × tp` 的 3D 设备网格，可以任意组合（如 `pp=2, sp=2, tp=2` 共 8 台设备）。所有维度都支持**按设备能力的非均匀切分**（异构边缘集群），并提供**自动规划器**、**网络模拟器**和**通信统计**。
 
-> 正确性：测试套件在 float64 下将 23 种并行配置（含所有组合、非均匀切分、zigzag、Megatron-SP、GQA/MQA、padding、EOS、采样）与一个独立实现的单设备参考模型逐 logit 比较（误差 ~1e-16），并与 Hugging Face `transformers` 的 LLaMA / Qwen2 实现对齐（float32 误差 ~2e-7）。
+> 正确性：测试套件在 float64 下将 31 种并行配置（含所有组合、非均匀切分、zigzag、Megatron-SP、GQA/MQA、padding、分块流水 prefill、EOS、采样）与一个独立实现的单设备参考模型逐 logit 比较（误差 ~1e-16），并与 Hugging Face `transformers` 的 LLaMA / Qwen2 实现对齐（float32 误差 ~2e-7）。
 
 ---
 
@@ -24,6 +24,7 @@
 - [异构集群与自动规划](#异构集群与自动规划)
 - [在自定义模型上使用并行原语](#在自定义模型上使用并行原语)
 - [网络模拟与策略对比](#网络模拟与策略对比)
+- [推理优化](#推理优化)
 - [配置参考](#配置参考)
 - [关键设计](#关键设计)
 - [测试](#测试)
@@ -268,6 +269,30 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 
 ---
 
+## 推理优化
+
+各项优化（默认开启的都是无损的）：
+
+| 优化 | 做法 | 效果 |
+| --- | --- | --- |
+| 注意力融合内核 | 使用 PyTorch SDPA / CPU flash kernel；位置允许时不构造掩码，GQA 不复制 K/V | 1024 token 时注意力快 11–23 倍；单设备 prefill 中注意力占比从约 60% 降到约 16% |
+| KV Cache 按 head 连续存储 | 缓存存为 `[B, H, T, D]`，对外仍是 token-major 视图 | 解码读取缓存无需拷贝，长上下文解码注意力约快 30% |
+| 融合投影 | Q/K/V、gate/up 各合成一次 GEMM；RoPE 每次前向只算一次 | prefill 的投影 GEMM 快 6–22% |
+| 小消息直接交换 | ≤64 KiB 的 all-reduce / all-gather / broadcast 一跳直接交换，按 rank 顺序求和 | 解码时的集合通信延迟约降到 1/3，结果逐位一致 |
+| SP 解码拆分（`sp_decode_split`） | 解码时 SP 各 rank 分担 MLP、输出投影和 LM head，TP 与 SP 的归约合并为一次 stage 级 all-reduce | SP 解码不再每个 rank 重复计算整层 |
+| 词表并行采样 | LM head 按词表切到整个 stage，只交换少量候选；计数器噪声的 Gumbel-max 采样 | 每个 token 不再收集完整词表 logits；采样结果与并行方式无关 |
+| 分块流水 prefill（`prefill_chunk`） | prompt 分块依次流过各 stage，后面的块使用前面块的 KV Cache | 单请求时各 stage 同时工作，降低首 token 时延 |
+| 激活通信压缩（`comm_dtype`，可选，有损） | TP/SP 集合通信与流水线激活以 float16 / bfloat16 传输，或流水线激活按行 int8 量化 | 通信字节减半（int8 流水线为 1/4），弱网下首 token 时延明显下降 |
+
+使用建议：
+
+- **通信压缩**优先用 `comm_dtype="float16"`（10 位尾数，超出范围时饱和而不是溢出）。在标准初始化（std 0.02）的随机模型上，float16 的 logits 相对误差 ≤7e-4，bfloat16 ≤6e-3，int8 流水线 ≤8e-3，生成的 16 个 token 全部一致；但在初始化更大（std 0.05）、扰动会逐层放大的随机模型上，bfloat16 / int8 会明显改变输出。请在目标模型上验证 bfloat16 / int8 的精度后再使用。
+- **分块流水 prefill** 在 `pp_size > 1` 时默认开启（每个 stage 约 2 块，至少 128 token）。实测单请求时 PP4 首 token 时延快约 1.9 倍；在一台机器上模拟多设备时，各进程共享内存带宽，收益会小于真实的多设备部署。
+- **OpenMP 线程等待策略**：`launch_local` 模拟多设备时默认设置 `OMP_WAIT_POLICY=PASSIVE`，避免空转的计算线程抢占通信线程（实测 TP2 解码约快 20%）；但它会让单进程的小算子唤醒变慢。在真实设备上可以两种都测一下。
+- **权重精度**：本仓库测试的 x86 CPU 没有原生 bf16 指令，PyTorch 的 int8 权重算子比 fp32 慢 4.6–58 倍，因此没有提供 int8 权重量化；`dtype=torch.bfloat16` 解码约快 1.4 倍、内存减半，但 prefill 约慢 4 倍。在带原生 bf16/int8 指令的设备上结论可能不同。
+
+---
+
 ## 配置参考
 
 `ParallelConfig` 字段：
@@ -282,6 +307,9 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 | `sp_weights` | `None` | SP 各 rank 的相对能力（非均匀 token 划分） |
 | `pp_layers` | `None` | 每个 stage 的层数（默认均分） |
 | `num_microbatches` | `pp_size` | 流水线 micro-batch 数 |
+| `prefill_chunk` | 自动 | 把 prompt 切成若干块在流水线各 stage 间并行流动（降低单请求首 token 时延）；`None` 在 `pp_size > 1` 时自动选择块大小，`0` 关闭 |
+| `sp_decode_split` | `True` | 解码时 SP 各 rank 分担 MLP、注意力输出投影和 LM head，而不是各自重复计算整层（无损） |
+| `comm_dtype` | `None` | 有损的激活通信压缩：`"float16"` / `"bfloat16"`（字节减半），`"int8"`（流水线激活按行 int8 量化，集合通信用 bfloat16） |
 | `attn_kv_block` | `None` | 注意力按 key 分块计算，限制长序列的峰值内存 |
 | `network` | `None` | `NetworkConfig(bandwidth_mbps, latency_ms)` 网络模拟 |
 
@@ -293,8 +321,10 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 - **SP 的 prefill / decode 两种形态。** Prefill 时 token 按 `SequenceLayout` 切分到 SP 组（ring 或 Ulysses）；decode 时新 token 在 SP 组内复制，各 rank 只对自己持有的那部分 KV Cache 计算注意力，再用 LSE 合并（每层一次很小的 all-gather），KV Cache 始终分布式存储。Ring 模式下新 token 的 KV 写入当前缓存最少的 rank，所有 rank 用同样的确定性规则得出一致结论，无需额外通信。
 - **GQA 感知的头划分。** 优先按整个 KV 组分配注意力头，避免复制 KV；KV 头少于设备数（如 MQA）时自动复制所需的 KV 头。TP 之后 Ulysses 还会在本地头上再划分一次，同样处理不规则分组。
 - **自描述的流水线通道。** `P2PChannel` 的每条消息带一个固定大小的头（消息类型、dtype、shape），stage 之间无需预先知道激活形状；`STOP` 控制消息随数据流传递，用于提前结束已生成完毕（EOS）的 micro-batch。生成时，最后一个 stage 采样后把 token 送回第一个 stage，多个 micro-batch 在流水线中交错，使所有 stage 保持忙碌。
-- **单点采样。** 只有最后一个 stage 的 leader 采样，并广播给其他 rank，因此即使异构硬件产生的 logits 有细微差别，所有 rank 得到的 token 也严格一致。
+- **词表并行采样。** LM head 在最后一个 stage 的所有 rank 上按词表切分，每个 rank 只提出少量候选，一次很小的 all-gather 后所有 rank 用纯比较得出相同的 token（贪心、温度采样、top-k），不需要收集完整词表的 logits，也不需要再广播；top-p 由一个 rank 决定后广播，候选不足以覆盖 nucleus 时自动退回完整词表，保证精确。随机采样使用 Gumbel-max 与按 `(seed, 序列, 步数, token)` 计算的计数器噪声，因此采样结果与并行方式和 micro-batch 划分无关，且即使异构硬件的 logits 有细微差别，各 rank 的结果也严格一致。
 - **后端兼容。** gloo 在一些版本中不支持非均匀的 all-gather / all-to-all（本仓库在 torch 2.14 上实测）：all-gather 采用补齐后裁剪的方式，all-to-all 采用 `all_to_all_single` 的非均匀 split，不支持时自动回退到点对点实现。
+- **小消息直接交换。** gloo 的 all-reduce 对解码阶段的小张量需要多步往返；不超过 64 KiB 的 all-reduce / all-gather / broadcast 改为所有 rank 一跳直接交换（实测延迟约为原来的 1/3），all-reduce 按固定 rank 顺序求和，结果在所有 rank 上逐位相同。
+- **注意力内核。** 注意力交给 PyTorch 的融合算子（SDPA；需要 LSE 时使用 CPU flash kernel）。位置允许时不构造掩码（无 padding 的 prefill 用 `is_causal`，解码时所有缓存的 key 都可见则不需要掩码），GQA 不复制 K/V，需要掩码时按 query 分块以限制内存；KV Cache 按 head 连续存储。
 
 ---
 
@@ -305,16 +335,16 @@ pip install pytest            # 可选：pip install transformers safetensors �
 python -m pytest tests -q
 ```
 
-测试用 gloo 在本机启动多进程，覆盖：通信原语（原生/回退实现、非均匀大小、网络模拟）、TP 层与 `parallelize_module`、ring / Ulysses / 分布式 KV 注意力、流水线通道与 runner、规划器（DP 与暴力搜索对照）、以及引擎的完整矩阵——每种配置在每个 rank 上检查 prefill logits、贪心生成的 token 和逐步 logits 与独立参考实现一致，另外还测试 EOS、采样跨 rank 一致性以及 KV Cache 确实被均分。
+测试用 gloo 在本机启动多进程，覆盖：通信原语（原生/回退实现、小消息直接交换、非均匀大小、压缩、网络模拟）、TP 层与 `parallelize_module`、ring / Ulysses / 分布式 KV 注意力、流水线通道（含各种压缩编码）与 runner、词表并行采样（与单设备逐 token 一致、采样频率符合目标分布）、规划器（DP 与暴力搜索对照）、以及引擎的完整矩阵——每种配置在每个 rank 上检查 prefill logits、贪心生成的 token 和逐步 logits 与独立参考实现一致，另外还测试 EOS、采样跨并行方式一致性、KV Cache 确实被均分，以及压缩通信的误差与字节数。
 
 ---
 
 ## 局限与后续工作
 
 - 只在 CPU + gloo 上实际测试过；CUDA / NCCL 与 CPU/GPU 混合路径按设计支持，但未在本仓库的测试环境中验证。
-- 注意力为 PyTorch 数学实现（可用 `attn_kv_block` 限制内存），未接入 FlashAttention 等融合算子。
+- 注意力在 CPU 上使用 PyTorch 融合算子；GPU 上需要 LSE 的路径（ring attention、分布式 KV 解码）目前使用数学实现，尚未接入 CUDA 融合算子。
 - 模型族目前为 LLaMA / Mistral / Qwen2；其他结构可以直接组合 `parallel/` 中的原语。
-- 暂未实现连续批处理（continuous batching）、投机解码、量化，以及运行时的动态重新划分（设备掉线 / 负载变化）。
+- 暂未实现连续批处理（continuous batching）、投机解码、权重量化，以及运行时的动态重新划分（设备掉线 / 负载变化）。在本仓库测试的 x86 CPU（AVX-512，无原生 bf16）上，PyTorch 自带的 int8 权重算子比 fp32 慢 4.6–58 倍，因此没有提供 int8 权重量化；bf16 权重（`dtype=torch.bfloat16`）可使解码快约 1.4 倍、内存减半，但 prefill 会慢约 4 倍。
 - 规划器的代价模型是解析估计，用于比较策略、确定非均匀切分比例，不追求绝对时延的精确预测。
 
 ## 目录结构
