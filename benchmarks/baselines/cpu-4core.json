@@ -1,0 +1,233 @@
+{
+  "model": {
+    "vocab_size": 32000,
+    "hidden_size": 1024,
+    "intermediate_size": 2816,
+    "num_layers": 8,
+    "num_heads": 16,
+    "num_kv_heads": 4,
+    "max_position_embeddings": 8192
+  },
+  "workload": {
+    "batch": 1,
+    "prompt_len": 512,
+    "new_tokens": 32,
+    "repeats": 5,
+    "warmup": 1,
+    "dtype": "float32"
+  },
+  "network": null,
+  "environment": {
+    "torch": "2.14.0+cu130",
+    "python": "3.11.15",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_count": 4,
+    "threads_per_device": 1,
+    "commit": "1ac5ed4"
+  },
+  "results": {
+    "single": {
+      "prefill_s": {
+        "median": 1.6238864649999982,
+        "min": 1.602818909000007,
+        "max": 1.672611088999986
+      },
+      "decode_ms_per_step": {
+        "median": 87.06440335483803,
+        "min": 84.75945964516261,
+        "max": 94.79429422580756
+      },
+      "decode_tok_per_s": {
+        "median": 11.485750335006824,
+        "min": 10.549158134116388,
+        "max": 11.798093147200378
+      },
+      "total_s": {
+        "median": 4.322882968999977,
+        "min": 4.230362158000048,
+        "max": 4.6112342100000205
+      },
+      "max_sent_mb_per_run": 0.0,
+      "max_param_mb": 622.923776,
+      "max_kv_mb": 8.896512,
+      "devices": 1,
+      "parallel": {}
+    },
+    "TP2": {
+      "prefill_s": {
+        "median": 0.9833213430000001,
+        "min": 0.9005310000000009,
+        "max": 1.0245706540000015
+      },
+      "decode_ms_per_step": {
+        "median": 69.40553529032316,
+        "min": 68.20944000000121,
+        "max": 73.19190838709603
+      },
+      "decode_tok_per_s": {
+        "median": 14.408072725280526,
+        "min": 13.662712477876902,
+        "max": 14.66072731281744
+      },
+      "total_s": {
+        "median": 3.140898662999973,
+        "min": 3.0708484730000123,
+        "max": 3.2327186829999732
+      },
+      "max_sent_mb_per_run": 39.858432,
+      "max_param_mb": 311.496704,
+      "max_kv_mb": 4.448256,
+      "devices": 2,
+      "parallel": {
+        "tp_size": 2
+      }
+    },
+    "PP2": {
+      "prefill_s": {
+        "median": 1.7230685819999962,
+        "min": 1.6245282160000443,
+        "max": 1.7292817079999736
+      },
+      "decode_ms_per_step": {
+        "median": 94.80858677419373,
+        "min": 90.85634196774097,
+        "max": 101.49106919354908
+      },
+      "decode_tok_per_s": {
+        "median": 10.547567831400197,
+        "min": 9.85308370427101,
+        "max": 11.0063863274955
+      },
+      "total_s": {
+        "median": 4.668347897999979,
+        "min": 4.441074817000015,
+        "max": 4.77437895700001
+      },
+      "max_sent_mb_per_run": 2.241024,
+      "max_param_mb": 311.463936,
+      "max_kv_mb": 4.448256,
+      "devices": 2,
+      "parallel": {
+        "pp_size": 2
+      }
+    },
+    "SP2": {
+      "prefill_s": {
+        "median": 0.965315185999998,
+        "min": 0.9303662789999976,
+        "max": 1.0060819509999988
+      },
+      "decode_ms_per_step": {
+        "median": 99.93301958064465,
+        "min": 96.5018420322596,
+        "max": 108.0412044193545
+      },
+      "decode_tok_per_s": {
+        "median": 10.00670253131912,
+        "min": 9.255727991688882,
+        "max": 10.36249649686179
+      },
+      "total_s": {
+        "median": 4.066671121000013,
+        "min": 3.9219233820000454,
+        "max": 4.3145925229999875
+      },
+      "max_sent_mb_per_run": 5.24672,
+      "max_param_mb": 622.923776,
+      "max_kv_mb": 4.456448,
+      "devices": 2,
+      "parallel": {
+        "sp_size": 2,
+        "sp_layout": "zigzag"
+      }
+    },
+    "TP4": {
+      "prefill_s": {
+        "median": 0.6820758270000056,
+        "min": 0.6535746140000356,
+        "max": 0.7128296729999875
+      },
+      "decode_ms_per_step": {
+        "median": 105.7829643548376,
+        "min": 99.82973099999981,
+        "max": 114.48843461290205
+      },
+      "decode_tok_per_s": {
+        "median": 9.45331799027306,
+        "min": 8.734506706997172,
+        "max": 10.017055940980166
+      },
+      "total_s": {
+        "median": 3.957596045999992,
+        "min": 3.7767974879999997,
+        "max": 4.261971145999951
+      },
+      "max_sent_mb_per_run": 59.78752,
+      "max_param_mb": 155.783168,
+      "max_kv_mb": 2.224128,
+      "devices": 4,
+      "parallel": {
+        "tp_size": 4
+      }
+    },
+    "PP4": {
+      "prefill_s": {
+        "median": 1.7149992229999498,
+        "min": 1.6750375110000277,
+        "max": 1.7969368540000232
+      },
+      "decode_ms_per_step": {
+        "median": 99.75062138709465,
+        "min": 97.1603923870963,
+        "max": 101.66403612903386
+      },
+      "decode_tok_per_s": {
+        "median": 10.025000206458623,
+        "min": 9.836320080099728,
+        "max": 10.292259792610803
+      },
+      "total_s": {
+        "median": 4.799093053999968,
+        "min": 4.774421151999945,
+        "max": 4.879808118000028
+      },
+      "max_sent_mb_per_run": 2.241024,
+      "max_param_mb": 221.270016,
+      "max_kv_mb": 2.224128,
+      "devices": 4,
+      "parallel": {
+        "pp_size": 4
+      }
+    },
+    "PP2xTP2": {
+      "prefill_s": {
+        "median": 1.0232646829999794,
+        "min": 0.9281548879999946,
+        "max": 1.0689567769999258
+      },
+      "decode_ms_per_step": {
+        "median": 80.03902203226092,
+        "min": 77.92004977419208,
+        "max": 84.03416487096966
+      },
+      "decode_tok_per_s": {
+        "median": 12.493905780069817,
+        "min": 11.899921913134389,
+        "max": 12.833667366716831
+      },
+      "total_s": {
+        "median": 3.458000778999917,
+        "min": 3.389793606000012,
+        "max": 3.636638524000091
+      },
+      "max_sent_mb_per_run": 22.258176,
+      "max_param_mb": 155.7504,
+      "max_kv_mb": 2.224128,
+      "devices": 4,
+      "parallel": {
+        "pp_size": 2,
+        "tp_size": 2
+      }
+    }
+  }
+}
