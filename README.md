@@ -266,6 +266,28 @@ PP2xSP2           0.200          24.6    1.421         1.49       1.11         1
 
 可以看到边缘场景的典型取舍：TP 每层两次集合通信，对时延和带宽最敏感；PP 通信量最小，在弱网下最稳健；SP 把 KV Cache 均分到各设备（此处每设备 1/4），但权重在 SP 组内是复制的（param MB 更大），因此通常与 TP/PP 组合使用。
 
+### 可复现的 prefill / decode 基准
+
+[`benchmarks/bench_inference.py`](benchmarks/bench_inference.py) 固定模型（hidden 1024、8 层、GQA 16/4 头、32k 词表，随机权重）、随机种子、prompt 与每台模拟设备的 CPU 线程数（默认 1），对每种策略重复多次取中位数，分别报告 prefill（首 token 时延）与每步 decode 时延；`--output` 将结果与环境信息（torch 版本、CPU、commit）保存为 JSON，`--compare` 与已保存的基线对比，便于发现性能回退：
+
+```bash
+python benchmarks/bench_inference.py                                   # single,TP2,PP2,SP2
+python benchmarks/bench_inference.py --compare benchmarks/baselines/cpu-4core.json
+```
+
+基线（[`benchmarks/baselines/cpu-4core.json`](benchmarks/baselines/cpu-4core.json)，4 核 Xeon 2.8 GHz 容器，float32，batch 1，prompt 512，生成 32 个 token，5 次取中位数，重复运行波动约 ±5%）：
+
+```
+strategy      devices  prefill ms  decode ms/step  decode tok/s   sent MB  param MB   KV MB
+single              1      1623.9           87.06          11.5      0.00     622.9    8.90
+TP2                 2       983.3           69.41          14.4     39.86     311.5    4.45
+PP2                 2      1723.1           94.81          10.5      2.24     311.5    4.45
+SP2                 2       965.3           99.93          10.0      5.25     622.9    4.46
+TP4                 4       682.1          105.78           9.5     59.79     155.8    2.22
+PP4                 4      1715.0           99.75          10.0      2.24     221.3    2.22
+PP2xTP2             4      1023.3           80.04          12.5     22.26     155.8    2.22
+```
+
 ---
 
 ## 配置参考
@@ -329,5 +351,6 @@ collab_infer/
   planner/               planner.py（规划、代价模型、策略搜索）
   cli.py                 命令行（generate / plan）
 examples/                quickstart / custom_models / heterogeneous_edge / benchmark_strategies
+benchmarks/              bench_inference.py（可复现的 prefill/decode 基准）、baselines/
 tests/                   单元测试与多进程等价性测试
 ```
