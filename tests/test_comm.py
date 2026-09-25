@@ -93,3 +93,32 @@ def test_small_allreduce_bitwise_identical_on_all_ranks():
     for values, err in results:
         assert values == first
         assert err < 1e-5
+
+
+def _compressed_collectives(rank, world, comm_dtype):
+    ctx = ParallelContext(1, 1, world, comm_dtype=comm_dtype, small_message_bytes=0)
+    c = ctx.tp
+    g = torch.Generator().manual_seed(rank)
+    x = torch.randn(64, 32, generator=g)
+    xs = [torch.randn(64, 32, generator=torch.Generator().manual_seed(r)) for r in range(world)]
+    total = sum(xs)
+    exact = c.all_reduce(x.clone())
+    out = {
+        "exact_all_reduce": (exact - total).abs().max().item(),
+        "all_reduce": (c.all_reduce(x.clone(), compress=True) - total).abs().max().item(),
+        "all_gather": (c.all_gather(x, dim=0, compress=True) - torch.cat(xs)).abs().max().item(),
+        "reduce_scatter": (c.reduce_scatter(x.clone(), dim=0, compress=True) - total.chunk(world)[rank]).abs().max().item(),
+    }
+    a2a = c.all_to_all(list(x.chunk(world)), [(64 // world, 32)] * world, compress=True)
+    out["all_to_all"] = max((a - xs[j].chunk(world)[rank]).abs().max().item() for j, a in enumerate(a2a))
+    out["dtype"] = str(c.all_reduce(x.clone(), compress=True).dtype)
+    return out
+
+
+@pytest.mark.parametrize("comm_dtype,tol", [("float16", 5e-3), ("bfloat16", 5e-2)])
+def test_compressed_collectives_are_close(comm_dtype, tol):
+    for out in run_dist(_compressed_collectives, 2, comm_dtype):
+        assert out["exact_all_reduce"] < 1e-6  # compress=False stays exact
+        assert out["dtype"] == "torch.float32"  # results come back in the input dtype
+        for key in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
+            assert out[key] < tol, (key, out[key])

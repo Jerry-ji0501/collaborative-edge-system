@@ -42,6 +42,9 @@ from .sampling import Sampler, SamplingParams
 
 Prompts = Sequence[Sequence[int]]
 
+# smallest automatically chosen prefill chunk (smaller chunks make GEMMs inefficient)
+MIN_AUTO_CHUNK = 128
+
 
 @dataclass
 class GenerationResult:
@@ -61,7 +64,21 @@ class GenerationResult:
 
 
 class _MicroBatch:
-    def __init__(self, prompt_ids: List[int], prompts: Prompts, device: torch.device, reserve_tokens: int = 0) -> None:
+    """Per micro-batch generation state (every stage keeps its own copy).
+
+    Steps ``0 .. num_chunks - 1`` feed the (left-padded) prompt chunk by chunk;
+    the last chunk yields the first generated token and every later step feeds
+    one generated token.
+    """
+
+    def __init__(
+        self,
+        prompt_ids: List[int],
+        prompts: Prompts,
+        device: torch.device,
+        reserve_tokens: int = 0,
+        chunk_size: int = 0,
+    ) -> None:
         self.prompt_ids = prompt_ids
         self.seq_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)  # sampling noise keys
         B, S = len(prompts), max(len(p) for p in prompts)
@@ -71,8 +88,14 @@ class _MicroBatch:
             self.ids[b, S - len(p) :] = torch.tensor(list(p), dtype=torch.long)
             self.positions[b, S - len(p) :] = torch.arange(len(p))
         self.ids, self.positions = self.ids.to(device), self.positions.to(device)
+        if chunk_size and S > chunk_size:
+            self.chunks = [(a, min(a + chunk_size, S)) for a in range(0, S, chunk_size)]
+        else:
+            self.chunks = [(0, S)]
+        self.num_chunks = len(self.chunks)
         self.next_pos = torch.tensor([len(p) for p in prompts], dtype=torch.long, device=device)
-        self.cache = KVCache(reserve_tokens)
+        # the first chunk allocates room for the whole prompt and the generated tokens
+        self.cache = KVCache(reserve_tokens + S - self.chunks[0][1])
         self.step = 0
         self.generated: List[torch.Tensor] = []  # first stage
         self.done_first = torch.zeros(B, dtype=torch.bool, device=device)
@@ -81,11 +104,34 @@ class _MicroBatch:
         self.scores: List[torch.Tensor] = []
         self.first_token_time: Optional[float] = None
 
+    @property
+    def in_prefill(self) -> bool:
+        return self.step < self.num_chunks
+
+    @property
+    def emits_token(self) -> bool:
+        """Whether the last stage samples at this step (not for non-final chunks)."""
+        return self.step >= self.num_chunks - 1
+
+    @property
+    def gen_index(self) -> int:
+        """Index of the token sampled at this step (sampling noise key)."""
+        return self.step - (self.num_chunks - 1)
+
     def step_positions(self) -> torch.Tensor:
-        return self.positions if self.step == 0 else self.next_pos.unsqueeze(1)
+        if self.in_prefill:
+            a, b = self.chunks[self.step]
+            return self.positions[:, a:b]
+        return self.next_pos.unsqueeze(1)
+
+    def step_ids(self) -> torch.Tensor:
+        if self.in_prefill:
+            a, b = self.chunks[self.step]
+            return self.ids[:, a:b]
+        return self.generated[-1].unsqueeze(1)
 
     def advance(self) -> None:
-        if self.step > 0:
+        if not self.in_prefill:
             self.next_pos += 1
         self.step += 1
 
@@ -237,11 +283,21 @@ class CollabEngine:
         head = self.model.lm_head
         bias = None if head.bias is None else head.bias[row : row + count]
         logits = F.linear(h_last, head.weight[row : row + count], bias)
-        tokens = sampler.select(logits, offset, mb.seq_ids, mb.step, comm=self.ctx.stage)
+        tokens = sampler.select(logits, offset, mb.seq_ids, mb.gen_index, comm=self.ctx.stage)
         if eos is not None:
             tokens = torch.where(mb.done_last, torch.full_like(tokens, eos), tokens)
             mb.done_last |= tokens == eos
         return tokens
+
+    def _chunk_size(self, prompt_len: int) -> int:
+        """Tokens per prefill chunk for a prompt of ``prompt_len`` tokens (0 = no chunking)."""
+        pc = self.pc
+        if pc.prefill_chunk is not None:
+            return pc.prefill_chunk
+        if pc.pp_size == 1 or (pc.sp_size > 1 and pc.sp_mode == "ring"):
+            return 0  # ring prefill needs the whole prompt at once
+        # ~2 chunks per stage keep every stage busy; big enough for efficient GEMMs
+        return max(MIN_AUTO_CHUNK, -(-prompt_len // (2 * pc.pp_size)))
 
     def _broadcast_inputs(self, obj: Any) -> Any:
         return self.ctx.world.broadcast_object(obj if self.ctx.rank == 0 else None, src=0)
@@ -330,8 +386,17 @@ class CollabEngine:
         groups, start = [], 0
         for size in split_sizes(n, m):
             ids = list(range(start, start + size))
+            group = [prompts[i] for i in ids]
             # decoding appends at most max_new_tokens - 1 tokens to any rank's cache
-            groups.append(_MicroBatch(ids, [prompts[i] for i in ids], self.device, max(0, max_new_tokens - 1)))
+            groups.append(
+                _MicroBatch(
+                    ids,
+                    group,
+                    self.device,
+                    max(0, max_new_tokens - 1),
+                    self._chunk_size(max(len(p) for p in group)),
+                )
+            )
             start += size
         sampler = Sampler(sampling)
         t0 = time.perf_counter()
@@ -393,7 +458,7 @@ class CollabEngine:
             for mb in active:
                 # ---- receive the input of this step (or retire the micro-batch)
                 if first:
-                    if mb.step > 0:
+                    if mb.step >= mb.num_chunks:  # decoding: wait for the previous token
                         tokens = self.channel.recv(pp - 1).tensor if pp > 1 else mb.pending
                         if mb.first_token_time is None:
                             mb.first_token_time = time.perf_counter()
@@ -415,13 +480,14 @@ class CollabEngine:
                 # ---- run this stage
                 state, layout = self._make_state(mb.step_positions(), mb.cache)
                 if first:
-                    ids = mb.ids if mb.step == 0 else mb.generated[-1].unsqueeze(1)
-                    x = self._embed(ids, state, layout)
+                    x = self._embed(mb.step_ids(), state, layout)
                 else:
                     x = x_in
                 x = self.model.forward_layers(x, state)
                 # ---- hand over to the next stage (tokens loop back to stage 0)
-                if last:
+                if last and not mb.emits_token:
+                    pass  # an intermediate prompt chunk: only the KV cache was needed
+                elif last:
                     h_last = self._last_hidden(x, state, layout)
                     if return_scores:  # full-vocabulary logits only when asked for
                         mb.scores.append(self.model.logits(h_last))

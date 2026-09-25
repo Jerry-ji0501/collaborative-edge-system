@@ -48,6 +48,16 @@ CASES = [
     ("pp2_sp2_tp2_ring_megatron", dict(pp_size=2, sp_size=2, tp_size=2, sp_layout="zigzag", megatron_sp=True), {}),
     ("pp2_sp2_tp2_ulysses", dict(pp_size=2, sp_size=2, tp_size=2, sp_mode="ulysses"), {}),
     ("pp2_tp2_biases_tied", dict(pp_size=2, tp_size=2), dict(qkv_bias=True, o_bias=True, mlp_bias=True, tie_word_embeddings=True)),
+    # SP decoding without splitting the dense compute across SP ranks
+    ("sp2_ring_no_decode_split", dict(sp_size=2, sp_decode_split=False), {}),
+    ("sp2_ulysses_no_decode_split", dict(sp_size=2, sp_mode="ulysses", sp_decode_split=False), {}),
+    # chunked (pipelined) prefill: later chunks attend to the cache of earlier ones
+    ("single_chunked_prefill", dict(prefill_chunk=4), {}),
+    ("pp2_chunked_prefill", dict(pp_size=2, prefill_chunk=3), {}),
+    ("pp3_chunked_microbatches", dict(pp_size=3, prefill_chunk=2, num_microbatches=2), {}),
+    ("pp2_sp2_ulysses_chunked", dict(pp_size=2, sp_size=2, sp_mode="ulysses", prefill_chunk=4), {}),
+    ("pp2_sp2_ring_chunked", dict(pp_size=2, sp_size=2, prefill_chunk=4), {}),
+    ("pp2_tp2_megatron_chunked", dict(pp_size=2, tp_size=2, megatron_sp=True, prefill_chunk=3), {}),
 ]
 
 
@@ -127,9 +137,14 @@ def _sampling_worker(rank, world, pc_dict):
     return eng.generate(PROMPTS, max_new_tokens=NEW_TOKENS, sampling=params).tokens
 
 
-def test_sampling_is_consistent_across_ranks_and_layouts():
+@pytest.mark.parametrize(
+    "pc",
+    [dict(pp_size=2, sp_size=2, tp_size=2), dict(pp_size=2, prefill_chunk=3), dict(sp_size=2, sp_mode="ulysses")],
+    ids=["pp2_sp2_tp2", "pp2_chunked", "sp2_ulysses"],
+)
+def test_sampling_is_consistent_across_ranks_and_layouts(pc):
     single = run_dist(_sampling_worker, 1, {})[0]
-    parallel = run_dist(_sampling_worker, 8, dict(pp_size=2, sp_size=2, tp_size=2))
+    parallel = run_dist(_sampling_worker, ParallelConfig.from_dict(pc).world_size, pc)
     assert all(tokens == single for tokens in parallel)
 
 
@@ -152,3 +167,40 @@ def test_kv_cache_is_distributed(pc):
     per_rank = run_dist(_kv_worker, 2, pc)
     assert sum(per_rank) == total  # nothing is replicated
     assert max(per_rank) <= 0.6 * total  # and the load is balanced
+
+
+# --------------------------------------------------------------------------
+def _compressed_worker(rank, world, pc_dict, ref_logits):
+    cfg = _model({})
+    eng = CollabEngine(cfg, ParallelConfig.from_dict(pc_dict), random_state_dict(cfg, seed=0, dtype=torch.float64), dtype=torch.float64)
+    ids, mask = _padded(PROMPTS)
+    logits = eng.forward(ids, mask, broadcast=True)
+    S = ids.shape[1]
+    err = max(
+        ((logits[b, S - len(p) :] - ref_logits[b]).abs().max() / ref_logits[b].abs().max()).item()
+        for b, p in enumerate(PROMPTS)
+    )
+    tokens = eng.generate(PROMPTS, max_new_tokens=NEW_TOKENS).tokens
+    return err, eng.comm_stats.total_bytes, tokens
+
+
+@pytest.mark.parametrize(
+    "pc,tol",
+    [
+        (dict(pp_size=2, comm_dtype="int8"), 5e-2),
+        (dict(tp_size=2, comm_dtype="float16"), 5e-3),
+        (dict(sp_size=2, comm_dtype="bfloat16"), 5e-2),
+        (dict(sp_size=2, sp_mode="ulysses", comm_dtype="float16"), 5e-3),
+        (dict(pp_size=2, sp_size=2, tp_size=2, comm_dtype="bfloat16"), 5e-2),
+    ],
+    ids=["pp2_int8", "tp2_fp16", "sp2_ring_bf16", "sp2_ulysses_fp16", "pp2_sp2_tp2_bf16"],
+)
+def test_compressed_communication_is_close_and_smaller(pc, tol):
+    ref_logits, ref_tokens, _ = _reference(())
+    world = ParallelConfig.from_dict(pc).world_size
+    compressed = run_dist(_compressed_worker, world, pc, ref_logits)
+    plain = run_dist(_compressed_worker, world, {k: v for k, v in pc.items() if k != "comm_dtype"}, ref_logits)
+    assert max(r[0] for r in compressed) < tol
+    assert sum(r[1] for r in compressed) < 0.8 * sum(r[1] for r in plain)  # fewer bytes on the wire
+    for r in compressed:
+        assert len(r[2]) == len(PROMPTS) and all(len(t) == NEW_TOKENS for t in r[2])

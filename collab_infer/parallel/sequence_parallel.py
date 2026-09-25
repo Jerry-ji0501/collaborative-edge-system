@@ -98,8 +98,10 @@ def ring_attention(
     if len(kv_sizes) != n or kv_sizes[r] != k.shape[1]:
         raise ValueError(f"kv_sizes {list(kv_sizes)} inconsistent with local block of {k.shape[1]} tokens")
     B, _, Hkv, D = k.shape
-    kv = torch.stack([k, v]).contiguous()  # one message per step for K and V
-    pos = k_pos.contiguous()
+    # K and V travel as one message, optionally in a narrower dtype; the local
+    # block is used at full precision and received blocks are forwarded as-is
+    wire = comm.to_wire(torch.stack([k, v])).contiguous()
+    k_cur, v_cur, pos = k, v, k_pos.contiguous()
     out = lse = None
     nxt, prv = (r + 1) % n, (r - 1) % n
     for step in range(n):
@@ -107,21 +109,22 @@ def ring_attention(
         if step < n - 1:
             src = (r - step - 1) % n  # origin of the block arriving next
             pending = [
-                comm.isend(kv, nxt, tag=TAG_RING_KV),
+                comm.isend(wire, nxt, tag=TAG_RING_KV),
                 comm.isend(pos, nxt, tag=TAG_RING_POS),
-                comm.irecv((2, B, kv_sizes[src], Hkv, D), kv.dtype, prv, tag=TAG_RING_KV),
+                comm.irecv((2, B, kv_sizes[src], Hkv, D), wire.dtype, prv, tag=TAG_RING_KV),
                 comm.irecv((B, kv_sizes[src]), pos.dtype, prv, tag=TAG_RING_POS, emulate=False),
             ]
         if not fully_masked(q_pos, pos, causal):
             o, l = attention_with_lse(
-                q, kv[0], kv[1], q_pos, pos, causal=causal, scale=scale, kv_map=kv_map, kv_block=kv_block
+                q, k_cur, v_cur, q_pos, pos, causal=causal, scale=scale, kv_map=kv_map, kv_block=kv_block
             )
             out, lse = (o, l) if out is None else merge_attention(out, lse, o, l)
         if pending:
             pending[0].wait()
             pending[1].wait()
-            kv = pending[2].wait()
+            wire = pending[2].wait()
             pos = pending[3].wait()
+            k_cur, v_cur = wire[0].to(k.dtype), wire[1].to(k.dtype)
     if out is None:  # every key invisible (e.g. all padding)
         return torch.zeros_like(q)
     return out.to(q.dtype)
@@ -169,7 +172,7 @@ def ulysses_scatter(
         for sh in head_shards
     ]
     width = me.q_count + 2 * me.kv_count
-    received = comm.all_to_all(sends, [(B, seq_sizes[j], width, D) for j in range(n)])
+    received = comm.all_to_all(sends, [(B, seq_sizes[j], width, D) for j in range(n)], compress=True)
     full = torch.cat(received, dim=1) if n > 1 else received[0]
     q_f, k_f, v_f = full.split([me.q_count, me.kv_count, me.kv_count], dim=2)
     pos_f = comm.all_gather(positions, dim=1, sizes=seq_sizes)
@@ -187,7 +190,7 @@ def ulysses_gather(
     B, _, _, D = out_heads.shape
     starts = offsets_of(seq_sizes)
     sends = [out_heads[:, st : st + sz].contiguous() for st, sz in zip(starts, seq_sizes)]
-    back = comm.all_to_all(sends, [(B, seq_sizes[r], head_shards[j].q_count, D) for j in range(n)])
+    back = comm.all_to_all(sends, [(B, seq_sizes[r], head_shards[j].q_count, D) for j in range(n)], compress=True)
     return torch.cat(back, dim=2) if n > 1 else back[0]
 
 

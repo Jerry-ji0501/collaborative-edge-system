@@ -75,9 +75,9 @@ def reduce_partial(
 ) -> torch.Tensor:
     """Combine row-parallel partial sums."""
     if reduce == "all_reduce":
-        return comm.all_reduce(y)
+        return comm.all_reduce(y, compress=True)
     if reduce == "reduce_scatter":
-        return comm.reduce_scatter(y, dim=scatter_dim, sizes=scatter_sizes)
+        return comm.reduce_scatter(y, dim=scatter_dim, sizes=scatter_sizes, compress=True)
     if reduce == "none":
         return y
     raise ValueError(f"unknown reduce mode {reduce!r}; expected one of {REDUCE_MODES}")

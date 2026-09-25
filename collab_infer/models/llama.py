@@ -216,7 +216,7 @@ class ParallelAttention(nn.Module):
             local = out[:, :, head_start : head_start + head_count]
         # each rank projects its heads; one all-reduce over the stage sums SP and TP partials
         weight = self.o_proj.weight[:, head_start * d : (head_start + head_count) * d]
-        out = self.stage.all_reduce(F.linear(local.reshape(B, S, head_count * d), weight))
+        out = self.stage.all_reduce(F.linear(local.reshape(B, S, head_count * d), weight), compress=True)
         return out if self.o_proj.bias is None else out + self.o_proj.bias
 
     def _attend(self, q, k, v, state: ForwardState, cache: Optional[LayerKVCache]) -> torch.Tensor:
@@ -314,7 +314,7 @@ class ParallelMLP(nn.Module):
         up_lo = units + start
         up = F.linear(x, weight[up_lo : up_lo + count], None if bias is None else bias[up_lo : up_lo + count])
         partial = F.linear(self.act(gate) * up, self.down_proj.weight[:, start : start + count])
-        out = self.stage.all_reduce(partial)  # sums SP and TP partials at once
+        out = self.stage.all_reduce(partial, compress=True)  # sums SP and TP partials at once
         return out if self.down_proj.bias is None else out + self.down_proj.bias
 
 
@@ -331,7 +331,7 @@ class DecoderLayer(nn.Module):
 
     def _gather(self, h: torch.Tensor, state: ForwardState) -> torch.Tensor:
         if state.tp_sp_sizes:  # Megatron SP: norms ran on 1/tp of the tokens
-            return self.tp.all_gather(h, dim=1, sizes=state.tp_sp_sizes)
+            return self.tp.all_gather(h, dim=1, sizes=state.tp_sp_sizes, compress=True)
         return h
 
     def forward(self, x, state: ForwardState, cache: Optional[LayerKVCache], rotary: RotaryEmbedding):
@@ -404,7 +404,7 @@ class LlamaStage(nn.Module):
         """Final norm; returns hidden states of all SP-local tokens."""
         h = self.norm(x)
         if state.tp_sp_sizes:
-            h = self.ctx.tp.all_gather(h, dim=1, sizes=state.tp_sp_sizes)
+            h = self.ctx.tp.all_gather(h, dim=1, sizes=state.tp_sp_sizes, compress=True)
         return h
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:

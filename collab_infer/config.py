@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 SP_MODES = ("ring", "ulysses")
 SP_LAYOUTS = ("contiguous", "zigzag")
+COMM_DTYPES = ("float16", "bfloat16", "int8")
 
 Weights = Sequence[float]
 
@@ -84,8 +85,17 @@ class ParallelConfig:
         pp_layers: number of decoder layers per pipeline stage.
         num_microbatches: micro-batches used to keep the pipeline busy.
             Defaults to ``pp_size``.
+        prefill_chunk: split prompts into chunks of this many tokens that flow
+            through the pipeline stages concurrently (lower time-to-first-token
+            when a single request occupies the pipeline).  ``None`` picks a
+            size automatically when ``pp_size > 1``; ``0`` disables chunking.
         attn_kv_block: if set, attention is computed in key blocks of this
             size (bounded memory for long contexts).
+        comm_dtype: lossy compression of activations on the network for
+            bandwidth-limited links: ``"float16"``/``"bfloat16"`` (half the
+            bytes of float32) or ``"int8"`` (row-quantised pipeline
+            activations, bfloat16 collectives).  ``None`` sends activations
+            unmodified.
         network: optional emulated network characteristics.
     """
 
@@ -100,7 +110,9 @@ class ParallelConfig:
     sp_weights: Optional[Weights] = None
     pp_layers: Optional[Sequence[int]] = None
     num_microbatches: Optional[int] = None
+    prefill_chunk: Optional[int] = None
     attn_kv_block: Optional[int] = None
+    comm_dtype: Optional[str] = None
     network: Optional[NetworkConfig] = None
 
     @property
@@ -140,8 +152,12 @@ class ParallelConfig:
             raise ValueError(f"cannot split {num_layers} layers into {self.pp_size} stages")
         if self.num_microbatches is not None and self.num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
+        if self.prefill_chunk is not None and self.prefill_chunk < 0:
+            raise ValueError("prefill_chunk must be >= 0")
         if self.attn_kv_block is not None and self.attn_kv_block < 1:
             raise ValueError("attn_kv_block must be >= 1")
+        if self.comm_dtype is not None and self.comm_dtype not in COMM_DTYPES:
+            raise ValueError(f"comm_dtype must be one of {COMM_DTYPES}, got {self.comm_dtype!r}")
         return self
 
     # ----------------------------------------------------------------- helpers
@@ -161,6 +177,12 @@ class ParallelConfig:
                 parts.append(f"layout={self.sp_layout}")
         if self.megatron_sp and self.tp_size > 1:
             parts.append("megatron_sp")
+        if self.comm_dtype:
+            parts.append(f"comm_dtype={self.comm_dtype}")
+        if self.prefill_chunk is not None:
+            parts.append(f"prefill_chunk={self.prefill_chunk}")
+        if not self.sp_decode_split and self.sp_size > 1:
+            parts.append("no_sp_decode_split")
         if self.tp_weights is not None:
             parts.append(f"tp_weights={self.tp_weights}")
         if self.sp_weights is not None:
@@ -191,5 +213,5 @@ def _check_weights(weights: Weights, expected: int, name: str) -> None:
         raise ValueError(f"{name} entries must be positive, got {list(weights)}")
 
 
-__all__ = ["NetworkConfig", "ParallelConfig", "SP_LAYOUTS", "SP_MODES"]
+__all__ = ["COMM_DTYPES", "NetworkConfig", "ParallelConfig", "SP_LAYOUTS", "SP_MODES"]
 

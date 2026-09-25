@@ -54,8 +54,13 @@ _DTYPE_CODE = {dt: i for i, dt in enumerate(_DTYPES)}
 HEADER_SLOTS = 64
 MAX_DIMS = 8
 _FIXED = 4  # kind, number of tensors, payload bytes, arrival time (us)
-MAX_TENSORS = (HEADER_SLOTS - _FIXED) // (2 + MAX_DIMS)
+_PER_TENSOR = 3 + MAX_DIMS  # dtype, ndim, encoding, dims
+MAX_TENSORS = (HEADER_SLOTS - _FIXED) // _PER_TENSOR
 _ALIGN = 16
+
+# wire encodings of floating point tensors (ParallelConfig.comm_dtype)
+ENC_RAW, ENC_FP16, ENC_BF16, ENC_INT8 = 0, 1, 2, 3
+_ENCODING = {"float16": ENC_FP16, "bfloat16": ENC_BF16, "int8": ENC_INT8}
 
 MSG_DATA = 1
 MSG_STOP = 2
@@ -94,12 +99,36 @@ class P2PChannel:
         self._link_free_at: Dict[int, float] = defaultdict(float)
 
     # ---------------------------------------------------------------- sending
-    def send(self, tensors: TensorOrList, dst: int, kind: int = MSG_DATA) -> None:
+    @staticmethod
+    def _raw(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().contiguous().reshape(-1).view(torch.uint8)
+
+    def _encode(self, t: torch.Tensor, encoding: int) -> List[torch.Tensor]:
+        """Byte segments of ``t`` in the given wire encoding."""
+        if encoding == ENC_FP16:  # saturate instead of overflowing to inf
+            return [self._raw(t.clamp(-65504.0, 65504.0).to(torch.float16))]
+        if encoding == ENC_BF16:
+            return [self._raw(t.to(torch.bfloat16))]
+        if encoding == ENC_INT8:  # symmetric per-row (last dimension) quantisation
+            rows = t.detach().reshape(-1, t.shape[-1] if t.dim() else 1).to(torch.float32)
+            scale = rows.abs().amax(dim=1, keepdim=True) / 127.0
+            scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+            q = torch.round(rows / scale).clamp_(-127, 127).to(torch.int8)
+            return [self._raw(q), self._raw(scale)]
+        return [self._raw(t)]
+
+    def send(self, tensors: TensorOrList, dst: int, kind: int = MSG_DATA, compress: bool = True) -> None:
+        """Queue ``tensors`` for ``dst``.
+
+        With ``compress`` (the default) floating point tensors travel in the
+        communicator's ``comm_dtype`` encoding when one is configured.
+        """
         tensors = [tensors] if isinstance(tensors, torch.Tensor) else list(tensors)
         if len(tensors) > MAX_TENSORS:
             raise ValueError(f"a message carries at most {MAX_TENSORS} tensors")
         header = torch.zeros(HEADER_SLOTS, dtype=torch.int64)
         header[0], header[1] = kind, len(tensors)
+        wire_encoding = _ENCODING.get(self.comm.comm_dtype, ENC_RAW) if compress else ENC_RAW
         segments: List[torch.Tensor] = []
         nbytes = 0
         for i, t in enumerate(tensors):
@@ -107,19 +136,23 @@ class P2PChannel:
                 raise ValueError(f"tensors with more than {MAX_DIMS} dims are not supported")
             if t.dtype not in _DTYPE_CODE:
                 raise TypeError(f"unsupported dtype {t.dtype}")
-            base = _FIXED + i * (2 + MAX_DIMS)
+            encoding = wire_encoding if t.is_floating_point() and t.element_size() > 1 and t.numel() else ENC_RAW
+            if encoding in (ENC_FP16, ENC_BF16) and t.element_size() <= 2:
+                encoding = ENC_RAW  # already narrow
+            base = _FIXED + i * _PER_TENSOR
             header[base] = _DTYPE_CODE[t.dtype]
             header[base + 1] = t.dim()
+            header[base + 2] = encoding
             for d, extent in enumerate(t.shape):
-                header[base + 2 + d] = extent
-            raw = t.detach().contiguous().reshape(-1).view(torch.uint8)
-            if raw.device != self.comm.comm_device:
-                raw = raw.to(self.comm.comm_device)
-            segments.append(raw)
-            pad = (-raw.numel()) % _ALIGN
-            if pad:
-                segments.append(torch.zeros(pad, dtype=torch.uint8, device=raw.device))
-            nbytes += raw.numel() + pad
+                header[base + 3 + d] = extent
+            for raw in self._encode(t, encoding):
+                if raw.device != self.comm.comm_device:
+                    raw = raw.to(self.comm.comm_device)
+                segments.append(raw)
+                pad = (-raw.numel()) % _ALIGN
+                if pad:
+                    segments.append(torch.zeros(pad, dtype=torch.uint8, device=raw.device))
+                nbytes += raw.numel() + pad
         header[2] = nbytes
         emulator = self.comm.emulator
         if emulator is not None:
@@ -159,17 +192,33 @@ class P2PChannel:
             payload = self.comm.recv((nbytes,), torch.uint8, src, tag=self.TAG_PAYLOAD, emulate=False)
         tensors = []
         offset = 0
+
+        def take(nbytes: int, dtype: torch.dtype) -> torch.Tensor:
+            nonlocal offset
+            raw = payload[offset : offset + nbytes] if nbytes else torch.zeros(0, dtype=torch.uint8)
+            offset += nbytes + (-nbytes) % _ALIGN
+            return raw.view(dtype)
+
         for i in range(count):
-            base = _FIXED + i * (2 + MAX_DIMS)
+            base = _FIXED + i * _PER_TENSOR
             dtype = _DTYPES[h[base]]
-            shape = tuple(h[base + 2 : base + 2 + h[base + 1]])
+            encoding = h[base + 2]
+            shape = tuple(h[base + 3 : base + 3 + h[base + 1]])
             numel = 1
             for extent in shape:
                 numel *= extent
-            size = numel * torch.empty(0, dtype=dtype).element_size()
-            raw = payload[offset : offset + size] if size else torch.zeros(0, dtype=torch.uint8)
-            tensors.append(raw.view(dtype).reshape(shape))
-            offset += size + (-size) % _ALIGN
+            if encoding == ENC_INT8:  # only used for non-empty tensors
+                cols = shape[-1] if shape else 1
+                rows = numel // cols
+                q = take(numel, torch.int8)
+                scale = take(rows * 4, torch.float32)
+                t = (q.reshape(rows, cols).to(torch.float32) * scale.reshape(rows, 1)).to(dtype).reshape(shape)
+            elif encoding in (ENC_FP16, ENC_BF16):
+                wire = torch.float16 if encoding == ENC_FP16 else torch.bfloat16
+                t = take(numel * 2, wire).to(dtype).reshape(shape)
+            else:
+                t = take(numel * torch.empty(0, dtype=dtype).element_size(), dtype).reshape(shape)
+            tensors.append(t)
         if arrival_us:
             NetworkEmulator.sleep_until(arrival_us / 1e6, clock=time.time)
         return Message(kind, tensors)
