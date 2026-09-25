@@ -71,7 +71,11 @@ def init_distributed(
     GPU and ARM edge devices).  Returns the compute device of this process.
 
     On multi-homed edge devices set ``GLOO_SOCKET_IFNAME`` (e.g. ``wlan0``) so
-    gloo binds to the interface that reaches the other devices.
+    gloo binds to the interface that reaches the other devices.  When compute
+    uses every core, consider exporting ``OMP_WAIT_POLICY=PASSIVE`` *before*
+    starting Python: spinning OpenMP threads can delay gloo's network threads
+    and inflate collective latency during decoding (at the price of slower
+    wake-ups for small kernels, so measure both on your devices).
     """
     rank = int(os.environ.get("RANK", 0)) if rank is None else rank
     world_size = int(os.environ.get("WORLD_SIZE", 1)) if world_size is None else world_size
@@ -164,6 +168,10 @@ def launch_local(
     queue = ctx.SimpleQueue() if return_results else None
     # read by libtorch at import time, so it must be inherited by the children
     os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+    if world_size > 1:
+        # simulated devices share this host's cores: spinning OpenMP workers of
+        # one process starve the communication threads of the others
+        os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
     context = mp.start_processes(
         _local_entry,
         args=(fn, world_size, port, backend, tuple(args), threads, queue, timeout_s, env),

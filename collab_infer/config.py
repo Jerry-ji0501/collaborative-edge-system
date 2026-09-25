@@ -73,6 +73,11 @@ class ParallelConfig:
         megatron_sp: additionally apply Megatron-LM sequence parallelism inside
             each TP group (norms/residuals run on 1/tp of the tokens and the
             all-reduces become reduce-scatter + all-gather).
+        sp_decode_split: while decoding, the SP ranks of a stage share the
+            MLP, attention output projection and LM head like extra TP ranks
+            (they already hold those weights), instead of all recomputing the
+            whole layer.  Lossless; the TP and SP reductions are fused into
+            one collective over the stage.
         tp_weights: relative capability of TP ranks; either one list shared by
             all stages or one list per pipeline stage.
         sp_weights: relative capability of SP ranks (uneven token split).
@@ -90,6 +95,7 @@ class ParallelConfig:
     sp_mode: str = "ring"
     sp_layout: str = "contiguous"
     megatron_sp: bool = False
+    sp_decode_split: bool = True
     tp_weights: Optional[Union[Weights, Sequence[Weights]]] = None
     sp_weights: Optional[Weights] = None
     pp_layers: Optional[Sequence[int]] = None

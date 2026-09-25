@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from ..config import ParallelConfig
 from ..distributed.comm import CommStats
@@ -34,7 +35,7 @@ from ..models.cache import ForwardState, KVCache
 from ..models.config import ModelConfig
 from ..models.llama import LlamaStage
 from ..models.weights import WeightSource, open_weights
-from ..parallel.partition import SequenceLayout, split_sizes
+from ..parallel.partition import SequenceLayout, offsets_of, split_sizes
 from ..parallel.pipeline_parallel import P2PChannel, partition_layers
 from ..parallel.sequence_parallel import gather_sequence
 from .sampling import Sampler, SamplingParams
@@ -62,6 +63,7 @@ class GenerationResult:
 class _MicroBatch:
     def __init__(self, prompt_ids: List[int], prompts: Prompts, device: torch.device, reserve_tokens: int = 0) -> None:
         self.prompt_ids = prompt_ids
+        self.seq_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)  # sampling noise keys
         B, S = len(prompts), max(len(p) for p in prompts)
         self.ids = torch.zeros(B, S, dtype=torch.long)
         self.positions = torch.full((B, S), -1, dtype=torch.long)
@@ -141,6 +143,12 @@ class CollabEngine:
         self.model.load_weights(open_weights(weights))
         self.model.eval()
         self.channel = P2PChannel(self.ctx.pp)
+        self.vocab_slice = None  # (global offset, first local row, rows) of the LM head this rank scores
+        if self.ctx.is_last_stage:
+            head = self.model.lm_head
+            sizes = split_sizes(head.out_local, list(self.pc.sp_weights) if self.pc.sp_weights else self.ctx.sp_size)
+            row = offsets_of(sizes)[self.ctx.sp_rank]
+            self.vocab_slice = (head.out_start + row, row, sizes[self.ctx.sp_rank])
         self.last_kv_cache_bytes = 0  # KV cache held by this rank in the last generate()
         self.last_kv_cache_allocated_bytes = 0  # including reserved but unused slots
 
@@ -189,10 +197,12 @@ class CollabEngine:
                     cache.sp_lengths[owner] += S
             cache.num_tokens += S
         s_local = local_pos.shape[1]
+        # replicated tokens (decoding): SP ranks share the dense compute instead of repeating it
+        sp_split = pc.sp_decode_split and sp > 1 and not sharded
         tp_sp_sizes = None
-        if pc.megatron_sp and ctx.tp_size > 1 and s_local >= ctx.tp_size:
+        if pc.megatron_sp and ctx.tp_size > 1 and s_local >= ctx.tp_size and not sp_split:
             tp_sp_sizes = split_sizes(s_local, ctx.tp_size)
-        state = ForwardState(local_pos, sharded, sp_sizes, tp_sp_sizes, owner, cache)
+        state = ForwardState(local_pos, sharded, sp_sizes, tp_sp_sizes, owner, cache, sp_split=sp_split)
         return state, layout
 
     def _embed(self, ids: torch.Tensor, state: ForwardState, layout: Optional[SequenceLayout]) -> torch.Tensor:
@@ -200,9 +210,10 @@ class CollabEngine:
             ids = layout.shard(ids, self.ctx.sp_rank)
         return self.model.embed(ids, state)
 
-    def _last_token_logits(
+    def _last_hidden(
         self, x: torch.Tensor, state: ForwardState, layout: Optional[SequenceLayout]
     ) -> torch.Tensor:
+        """Final hidden state of the last token, ``[B, H]``, on every rank of the stage."""
         h = self.model.final_hidden(x, state)
         if layout is None:
             h_last = h[:, -1]
@@ -213,18 +224,22 @@ class CollabEngine:
             else:
                 h_last = h.new_empty((h.shape[0], h.shape[-1]))
             h_last = self.ctx.sp.broadcast(h_last, src=owner)
-        return self.model.logits(h_last)
+        return h_last
 
-    def _sample(self, logits: torch.Tensor, mb: _MicroBatch, sampler: Sampler, eos: Optional[int]) -> torch.Tensor:
-        """Sample on the stage leader and broadcast so every rank agrees."""
-        if self.ctx.is_stage_leader:
-            tokens = sampler(logits).to(torch.long)
-            if eos is not None:
-                tokens = torch.where(mb.done_last, torch.full_like(tokens, eos), tokens)
-        else:
-            tokens = torch.empty(logits.shape[0], dtype=torch.long, device=logits.device)
-        tokens = self.ctx.stage.broadcast(tokens, src=0)
+    def _select_tokens(self, h_last: torch.Tensor, mb: _MicroBatch, sampler: Sampler, eos: Optional[int]) -> torch.Tensor:
+        """Score this rank's vocabulary slice and agree on the next token.
+
+        The LM head is split over every rank of the last stage, and only a few
+        candidates per rank are exchanged (see :mod:`.sampling`), instead of
+        all-gathering full-vocabulary logits and broadcasting the choice.
+        """
+        offset, row, count = self.vocab_slice
+        head = self.model.lm_head
+        bias = None if head.bias is None else head.bias[row : row + count]
+        logits = F.linear(h_last, head.weight[row : row + count], bias)
+        tokens = sampler.select(logits, offset, mb.seq_ids, mb.step, comm=self.ctx.stage)
         if eos is not None:
+            tokens = torch.where(mb.done_last, torch.full_like(tokens, eos), tokens)
             mb.done_last |= tokens == eos
         return tokens
 
@@ -300,7 +315,8 @@ class CollabEngine:
         ``prompts`` (lists of token ids, possibly of different lengths) are
         read on rank 0 and the result is returned on every rank.
         """
-        prompts = self._broadcast_inputs(prompts)
+        sampling = (sampling or SamplingParams()).resolved() if self.ctx.rank == 0 else None
+        prompts, sampling = self._broadcast_inputs((prompts, sampling))
         if not prompts:
             raise ValueError("rank 0 must provide at least one prompt")
         vocab = self.model_config.vocab_size
@@ -406,10 +422,10 @@ class CollabEngine:
                 x = self.model.forward_layers(x, state)
                 # ---- hand over to the next stage (tokens loop back to stage 0)
                 if last:
-                    logits = self._last_token_logits(x, state, layout)
-                    if return_scores:
-                        mb.scores.append(logits)
-                    tokens = self._sample(logits, mb, sampler, eos)
+                    h_last = self._last_hidden(x, state, layout)
+                    if return_scores:  # full-vocabulary logits only when asked for
+                        mb.scores.append(self.model.logits(h_last))
+                    tokens = self._select_tokens(h_last, mb, sampler, eos)
                     if pp > 1:
                         self.channel.send(tokens, 0)
                     else:

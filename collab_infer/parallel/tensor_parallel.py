@@ -263,6 +263,61 @@ class ParallelLMHead(ColumnParallelLinear):
         super().__init__(hidden_size, vocab_size, comm, **kwargs)
 
 
+class FusedColumnParallelLinear(nn.Module):
+    """Several column-parallel projections of one input computed by a single GEMM.
+
+    Used for Q/K/V and for the gate/up projections of gated MLPs: one large
+    matrix multiplication is faster than several small ones.  ``parts`` lists,
+    per projection, ``(out_features, local_start, local_size)``; this rank's
+    weight is the concatenation of the local slices and :meth:`forward`
+    returns the per-projection outputs.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        parts: Sequence[Tuple[int, int, int]],
+        comm: Communicator,
+        *,
+        bias: bool = False,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.comm = comm
+        self.in_features = in_features
+        self.parts = [(int(o), int(s), int(n)) for o, s, n in parts]
+        for out, start, size in self.parts:
+            if start < 0 or size < 0 or start + size > out:
+                raise ValueError(f"local range ({start}, {size}) outside [0, {out})")
+        self.local_sizes = [n for _, _, n in self.parts]
+        total = sum(self.local_sizes)
+        self.weight = _empty_param(total, in_features, dtype=dtype, device=device)
+        self.bias = _empty_param(total, dtype=dtype, device=device) if bias else None
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        return list(F.linear(x, self.weight, self.bias).split(self.local_sizes, dim=-1))
+
+    @torch.no_grad()
+    def load_full(
+        self, weights: Sequence[torch.Tensor], biases: Optional[Sequence[Optional[torch.Tensor]]] = None
+    ) -> None:
+        """Load from the full (unsharded) parameters of every fused projection."""
+        if len(weights) != len(self.parts):
+            raise ValueError(f"expected {len(self.parts)} weights, got {len(weights)}")
+        offset = 0
+        for i, (_, start, size) in enumerate(self.parts):
+            _copy_into(self.weight[offset : offset + size], weights[i].narrow(0, start, size))
+            if self.bias is not None:
+                if biases is None or biases[i] is None:
+                    raise ValueError("layer has a bias but none was provided")
+                _copy_into(self.bias[offset : offset + size], biases[i].narrow(0, start, size))
+            offset += size
+
+    def extra_repr(self) -> str:
+        return f"in={self.in_features}, parts={self.parts}, bias={self.bias is not None}"
+
+
 # --------------------------------------------------------------------------
 # generic, plan-based parallelisation of arbitrary models
 # --------------------------------------------------------------------------
@@ -377,6 +432,7 @@ def parallelize_module(
 
 __all__ = [
     "ColumnParallelLinear",
+    "FusedColumnParallelLinear",
     "ColwiseParallel",
     "ParallelLMHead",
     "ParallelStyle",

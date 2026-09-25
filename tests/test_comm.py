@@ -8,8 +8,8 @@ from collab_infer.distributed import ParallelContext
 from helpers import run_dist
 
 
-def _collectives(rank, world, fallback):
-    ctx = ParallelContext(1, 1, world, force_comm_fallback=fallback)
+def _collectives(rank, world, fallback, small_bytes):
+    ctx = ParallelContext(1, 1, world, force_comm_fallback=fallback, small_message_bytes=small_bytes)
     c = ctx.tp
     sizes = [r + 1 for r in range(world)]
     out = {}
@@ -29,10 +29,14 @@ def _collectives(rank, world, fallback):
     return out
 
 
-@pytest.mark.parametrize("fallback", [False, True], ids=["native", "fallback"])
-def test_collectives_with_uneven_sizes(fallback):
+@pytest.mark.parametrize(
+    "fallback,small_bytes",
+    [(False, 0), (True, 0), (False, 1 << 16)],
+    ids=["native", "fallback", "direct-small-messages"],
+)
+def test_collectives_with_uneven_sizes(fallback, small_bytes):
     world = 3
-    results = run_dist(_collectives, world, fallback)
+    results = run_dist(_collectives, world, fallback, small_bytes)
     total = torch.arange(2 * 6, dtype=torch.float64).view(2, -1) * 6  # sum over ranks of (r+1)
     for rank, out in enumerate(results):
         assert out["all_reduce"] == [6.0] * 3
@@ -48,8 +52,8 @@ def test_collectives_with_uneven_sizes(fallback):
         assert out["calls"] > 0
 
 
-def _emulated(rank, world):
-    ctx = ParallelContext(1, 1, world, network=NetworkConfig(bandwidth_mbps=8, latency_ms=20))
+def _emulated(rank, world, small_bytes):
+    ctx = ParallelContext(1, 1, world, network=NetworkConfig(bandwidth_mbps=8, latency_ms=20), small_message_bytes=small_bytes)
     ctx.tp.barrier()
     t0 = time.perf_counter()
     ctx.tp.all_reduce(torch.zeros(12_500))  # 50 kB
@@ -57,10 +61,35 @@ def _emulated(rank, world):
     return elapsed, ctx.stats.as_dict()
 
 
-def test_network_emulation_delays_and_records():
-    results = run_dist(_emulated, 2)
-    # ring all-reduce of 50 kB over 2 ranks: 2 steps * 20 ms + 50 kB / 1 MB/s = 0.09 s
+@pytest.mark.parametrize(
+    "small_bytes,expected_s",
+    [
+        (0, 0.09),  # gloo ring all-reduce: 2 steps * 20 ms + 50 kB / 1 MB/s
+        (1 << 16, 0.07),  # direct exchange: 1 step * 20 ms + 50 kB / 1 MB/s
+    ],
+    ids=["ring", "direct"],
+)
+def test_network_emulation_delays_and_records(small_bytes, expected_s):
+    results = run_dist(_emulated, 2, small_bytes)
     for elapsed, stats in results:
-        assert elapsed >= 0.085
+        assert elapsed >= expected_s - 0.005
         assert stats["tp.all_reduce"]["calls"] == 1
         assert stats["tp.all_reduce"]["bytes"] == 50_000
+
+
+def _small_allreduce_is_identical(rank, world):
+    """The direct small-message all-reduce must give bitwise identical results everywhere."""
+    ctx = ParallelContext(1, 1, world)
+    g = torch.Generator().manual_seed(rank)
+    x = torch.randn(1000, generator=g, dtype=torch.float32)
+    out = ctx.tp.all_reduce(x.clone())
+    expected = sum(torch.randn(1000, generator=torch.Generator().manual_seed(r)) for r in range(world))
+    return out.tolist(), (out - expected).abs().max().item()
+
+
+def test_small_allreduce_bitwise_identical_on_all_ranks():
+    results = run_dist(_small_allreduce_is_identical, 4)
+    first = results[0][0]
+    for values, err in results:
+        assert values == first
+        assert err < 1e-5

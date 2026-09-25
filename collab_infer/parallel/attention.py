@@ -15,16 +15,42 @@ correctness only depends on every token carrying its true position.
 Tensor layout: ``q`` is ``[B, Sq, Hq, D]``, ``k``/``v`` are ``[B, Sk, Hkv, D]``,
 positions are ``[B, S]`` int64.  Grouped-query attention is expressed with a
 ``kv_map`` giving the KV head of every query head.
+
+Performance: the work is dispatched to PyTorch's fused kernels
+(``scaled_dot_product_attention`` and, when the LSE is needed, the CPU flash
+kernel).  No mask is materialised when the positions allow it (aligned causal
+prefill uses ``is_causal``; decoding where every cached key is visible uses no
+mask), grouped-query attention never copies K/V, and when a mask is needed the
+queries are processed in chunks so its memory stays bounded.  Inputs are only
+viewed as ``[B, H, S, D]``; a head-major KV cache therefore costs no copies.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence, Tuple, Union
+from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 KVMap = Optional[Union[torch.Tensor, Sequence[int]]]
+
+# max elements of a materialised mask per kernel call (bounded memory)
+MASK_CHUNK_ELEMENTS = 1 << 22
+
+_FLASH_CPU = getattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu", None)
+
+
+def _sdpa_supports_gqa() -> bool:
+    try:
+        x = torch.zeros(1, 2, 1, 2)
+        F.scaled_dot_product_attention(x, x[:, :1], x[:, :1], enable_gqa=True)
+        return True
+    except (TypeError, RuntimeError):
+        return False
+
+
+_SDPA_GQA = _sdpa_supports_gqa()
 
 
 def accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -56,12 +82,23 @@ def expand_kv(x: torch.Tensor, num_q_heads: int, kv_map: KVMap = None) -> torch.
     return x.index_select(2, index)
 
 
+def gqa_group(num_q_heads: int, num_kv_heads: int, kv_map: KVMap = None) -> Optional[int]:
+    """Group size ``g`` if query head ``h`` uses KV head ``h // g``, else ``None``."""
+    if num_kv_heads < 1 or num_q_heads % num_kv_heads:
+        return None
+    group = num_q_heads // num_kv_heads
+    if kv_map is None:
+        return group
+    mapping = kv_map.tolist() if isinstance(kv_map, torch.Tensor) else list(kv_map)
+    return group if mapping == [h // group for h in range(num_q_heads)] else None
+
+
 def visibility_mask(q_pos: torch.Tensor, k_pos: torch.Tensor, causal: bool = True) -> torch.Tensor:
     """Boolean ``[B, 1, Sq, Sk]`` mask of visible (query, key) pairs."""
     mask = (k_pos >= 0)[:, None, None, :]
     if causal:
         mask = mask & (k_pos[:, None, None, :] <= q_pos[:, None, :, None])
-    return mask
+    return mask.expand(q_pos.shape[0], 1, q_pos.shape[1], k_pos.shape[1])
 
 
 def fully_masked(q_pos: torch.Tensor, k_pos: torch.Tensor, causal: bool = True) -> bool:
@@ -76,14 +113,89 @@ def fully_masked(q_pos: torch.Tensor, k_pos: torch.Tensor, causal: bool = True) 
     return bool(q_pos.max() < valid_k.min())
 
 
-def _attention_block(qh, kh, vh, q_pos, k_pos, causal, scale):
-    scores = torch.matmul(qh, kh.transpose(-1, -2)) * scale  # [B, H, Sq, Sk]
-    scores = scores.masked_fill(~visibility_mask(q_pos, k_pos, causal), float("-inf"))
-    lse = torch.logsumexp(scores, dim=-1)  # [B, H, Sq]; -inf for fully masked rows
-    safe = torch.where(torch.isfinite(lse), lse, torch.zeros_like(lse))
-    probs = torch.exp(scores - safe.unsqueeze(-1))
-    out = torch.matmul(probs, vh)  # [B, H, Sq, D]
+def _mask_mode(q_pos: torch.Tensor, k_pos: torch.Tensor, causal: bool) -> str:
+    """``"none"`` (every query sees every key), ``"causal"`` (aligned causal) or ``"mask"``."""
+    if not bool((k_pos >= 0).all()):
+        return "mask"
+    if not causal:
+        return "none"
+    if bool((q_pos >= 0).all()) and bool((k_pos.amax(dim=1) <= q_pos.amin(dim=1)).all()):
+        return "none"  # e.g. decoding: all cached keys precede the query
+    if q_pos.shape == k_pos.shape and torch.equal(q_pos, k_pos):
+        if q_pos.shape[1] == 1 or bool((q_pos[:, 1:] - q_pos[:, :-1] == 1).all()):
+            return "causal"  # e.g. prefill without padding
+    return "mask"
+
+
+def _plan(q_pos: torch.Tensor, k_pos: torch.Tensor, causal: bool) -> Iterator[Tuple[int, int, str, Optional[torch.Tensor]]]:
+    """Yield ``(q_start, q_end, mode, bool_mask)`` chunks for one attention call."""
+    B, Sq = q_pos.shape
+    Sk = k_pos.shape[1]
+    mode = _mask_mode(q_pos, k_pos, causal)
+    if mode != "mask":
+        yield 0, Sq, mode, None
+        return
+    step = max(1, MASK_CHUNK_ELEMENTS // max(1, B * Sk))
+    for start in range(0, Sq, step):
+        end = min(Sq, start + step)
+        yield start, end, mode, visibility_mask(q_pos[:, start:end], k_pos, causal)
+
+
+def _prepare_kv(k: torch.Tensor, v: torch.Tensor, num_q_heads: int, kv_map: KVMap, native_gqa: bool):
+    group = gqa_group(num_q_heads, k.shape[2], kv_map)
+    if group is None or (group > 1 and not native_gqa):
+        k, v = expand_kv(k, num_q_heads, kv_map), expand_kv(v, num_q_heads, kv_map)
+        group = 1
+    return k, v, group
+
+
+def _empty_result(q: torch.Tensor, acc: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, Sq, Hq, D = q.shape
+    return (
+        torch.zeros(B, Sq, Hq, D, dtype=acc, device=q.device),
+        torch.full((B, Hq, Sq), float("-inf"), dtype=acc, device=q.device),
+    )
+
+
+# --------------------------------------------------------------------------
+# attention with LSE (needed to merge partial results)
+# --------------------------------------------------------------------------
+def _flash_lse(q, k, v, q_pos, k_pos, causal, scale, kv_map, acc):
+    k, v, _ = _prepare_kv(k, v, q.shape[2], kv_map, native_gqa=True)
+    qh, kh, vh = (t.to(acc).transpose(1, 2) for t in (q, k, v))
+    outs: List[torch.Tensor] = []
+    lses: List[torch.Tensor] = []
+    for start, end, mode, mask in _plan(q_pos, k_pos, causal):
+        bias = None
+        if mask is not None:
+            bias = torch.zeros(mask.shape, dtype=acc, device=q.device).masked_fill(~mask, float("-inf"))
+        o, l = _FLASH_CPU(qh[:, :, start:end], kh, vh, 0.0, mode == "causal", attn_mask=bias, scale=scale)
+        if mask is not None:  # the kernel reports lse = 0 for rows without visible keys
+            empty = ~mask.any(dim=-1)  # [B, 1, sq]
+            l = l.masked_fill(empty, float("-inf"))
+            o = o.masked_fill(empty.unsqueeze(-1), 0.0)
+        outs.append(o)
+        lses.append(l)
+    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
+    lse = lses[0] if len(lses) == 1 else torch.cat(lses, dim=2)
     return out.transpose(1, 2), lse
+
+
+def _math_lse(q, k, v, q_pos, k_pos, causal, scale, kv_map, acc):
+    """Portable reference path; grouped-query attention without copying K/V."""
+    B, Sq, Hq, D = q.shape
+    k, v, group = _prepare_kv(k, v, Hq, kv_map, native_gqa=True)
+    Hkv = k.shape[2]
+    qg = q.to(acc).permute(0, 2, 1, 3).reshape(B, Hkv, group * Sq, D)  # head h = kv * group + i
+    kh, vh = k.to(acc).transpose(1, 2), v.to(acc).transpose(1, 2)
+    scores = torch.matmul(qg, kh.transpose(-1, -2)) * scale  # [B, Hkv, group * Sq, Sk]
+    mask = visibility_mask(q_pos, k_pos, causal).repeat(1, 1, group, 1)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    safe = torch.where(torch.isfinite(lse), lse, torch.zeros_like(lse))
+    out = torch.matmul(torch.exp(scores - safe.unsqueeze(-1)), vh)  # [B, Hkv, group * Sq, D]
+    out = out.reshape(B, Hq, Sq, D).transpose(1, 2)
+    return out, lse.reshape(B, Hq, Sq)
 
 
 def attention_with_lse(
@@ -103,36 +215,28 @@ def attention_with_lse(
     ``out`` is ``[B, Sq, Hq, D]`` and ``lse`` is ``[B, Hq, Sq]``.  Rows without
     any visible key produce ``out = 0`` and ``lse = -inf`` (never NaN), which
     makes them neutral elements for :func:`merge_attention`.
-    ``kv_block`` bounds memory by processing keys in blocks.
+    ``kv_block`` additionally processes the keys in blocks.
     """
-    B, Sq, Hq, D = q.shape
     acc = accumulation_dtype(q.dtype)
-    scale = 1.0 / math.sqrt(D) if scale is None else scale
+    scale = 1.0 / math.sqrt(q.shape[-1]) if scale is None else scale
     Sk = k.shape[1]
-    if Sk == 0 or Sq == 0:
-        return (
-            torch.zeros(B, Sq, Hq, D, dtype=acc, device=q.device),
-            torch.full((B, Hq, Sq), float("-inf"), dtype=acc, device=q.device),
-        )
-    qh = q.transpose(1, 2).to(acc)
-    kh = expand_kv(k, Hq, kv_map).transpose(1, 2).to(acc)
-    vh = expand_kv(v, Hq, kv_map).transpose(1, 2).to(acc)
-    if kv_block is None or kv_block >= Sk:
-        return _attention_block(qh, kh, vh, q_pos, k_pos, causal, scale)
-    out = lse = None
-    for start in range(0, Sk, kv_block):
-        end = min(start + kv_block, Sk)
-        kp = k_pos[:, start:end]
-        if fully_masked(q_pos, kp, causal):
-            continue
-        o, l = _attention_block(qh, kh[:, :, start:end], vh[:, :, start:end], q_pos, kp, causal, scale)
-        out, lse = (o, l) if out is None else merge_attention(out, lse, o, l)
-    if out is None:
-        return (
-            torch.zeros(B, Sq, Hq, D, dtype=acc, device=q.device),
-            torch.full((B, Hq, Sq), float("-inf"), dtype=acc, device=q.device),
-        )
-    return out, lse
+    if Sk == 0 or q.shape[1] == 0:
+        return _empty_result(q, acc)
+    if kv_block is not None and kv_block < Sk:
+        out = lse = None
+        for start in range(0, Sk, kv_block):
+            end = min(start + kv_block, Sk)
+            kp = k_pos[:, start:end]
+            if fully_masked(q_pos, kp, causal):
+                continue
+            o, l = attention_with_lse(
+                q, k[:, start:end], v[:, start:end], q_pos, kp, causal=causal, scale=scale, kv_map=kv_map
+            )
+            out, lse = (o, l) if out is None else merge_attention(out, lse, o, l)
+        return _empty_result(q, acc) if out is None else (out, lse)
+    if _FLASH_CPU is not None and q.device.type == "cpu":
+        return _flash_lse(q, k, v, q_pos, k_pos, causal, scale, kv_map, acc)
+    return _math_lse(q, k, v, q_pos, k_pos, causal, scale, kv_map, acc)
 
 
 def merge_attention(
@@ -160,25 +264,51 @@ def merge_attention_list(
     return out, lse
 
 
+# --------------------------------------------------------------------------
+# plain attention
+# --------------------------------------------------------------------------
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     q_pos: torch.Tensor,
     k_pos: torch.Tensor,
-    **kwargs,
+    *,
+    causal: bool = True,
+    scale: Optional[float] = None,
+    kv_map: KVMap = None,
+    kv_block: Optional[int] = None,
 ) -> torch.Tensor:
-    """Plain (single-device) attention; returns ``q.dtype``."""
-    out, _ = attention_with_lse(q, k, v, q_pos, k_pos, **kwargs)
-    return out.to(q.dtype)
+    """Single-device attention; returns ``[B, Sq, Hq, D]`` in ``q.dtype``."""
+    Sk = k.shape[1]
+    if kv_block is not None and kv_block < Sk:
+        out, _ = attention_with_lse(q, k, v, q_pos, k_pos, causal=causal, scale=scale, kv_map=kv_map, kv_block=kv_block)
+        return out.to(q.dtype)
+    if Sk == 0 or q.shape[1] == 0:
+        return torch.zeros_like(q)
+    k, v, group = _prepare_kv(k, v, q.shape[2], kv_map, native_gqa=_SDPA_GQA)
+    qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    extra = {"enable_gqa": True} if group > 1 else {}
+    outs = []
+    for start, end, mode, mask in _plan(q_pos, k_pos, causal):
+        o = F.scaled_dot_product_attention(
+            qh[:, :, start:end], kh, vh, attn_mask=mask, is_causal=mode == "causal", scale=scale, **extra
+        )
+        if mask is not None:  # rows without visible keys are 0 (some releases return NaN)
+            o = o.masked_fill(~mask.any(dim=-1, keepdim=True), 0.0)
+        outs.append(o)
+    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
+    return out.transpose(1, 2)
 
 
 __all__ = [
+    "MASK_CHUNK_ELEMENTS",
     "accumulation_dtype",
     "attention",
     "attention_with_lse",
     "expand_kv",
     "fully_masked",
+    "gqa_group",
     "merge_attention",
     "merge_attention_list",
     "visibility_mask",

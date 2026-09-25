@@ -22,16 +22,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..distributed.mesh import ParallelContext
-from ..parallel.attention import accumulation_dtype, attention
-from ..parallel.partition import HeadShard, partition_heads, split_sizes
+from ..parallel.attention import accumulation_dtype, attention, gqa_group
+from ..parallel.partition import HeadShard, offsets_of, partition_heads, split_sizes
 from ..parallel.sequence_parallel import (
     distributed_kv_attention,
     gather_heads,
     ring_attention,
-    ulysses_attention,
+    ulysses_gather,
+    ulysses_scatter,
 )
 from ..parallel.tensor_parallel import (
-    ColumnParallelLinear,
+    FusedColumnParallelLinear,
     ParallelLMHead,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -101,7 +102,7 @@ class ParallelAttention(nn.Module):
         device=None,
     ) -> None:
         super().__init__()
-        self.tp, self.sp = ctx.tp, ctx.sp
+        self.tp, self.sp, self.stage = ctx.tp, ctx.sp, ctx.stage
         self.sp_mode = sp_mode
         self.kv_block = kv_block
         me = tp_shards[self.tp.rank]
@@ -109,28 +110,37 @@ class ParallelAttention(nn.Module):
         self.head_dim = d
         self.num_q, self.num_kv = me.q_count, me.kv_count
         kw = dict(dtype=dtype, device=device)
-        self.q_proj = ColumnParallelLinear(
-            hidden, config.q_size, self.tp, local_range=(me.q_start * d, me.q_count * d), bias=config.qkv_bias, **kw
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden, config.kv_size, self.tp, local_range=(me.kv_start * d, me.kv_count * d), bias=config.qkv_bias, **kw
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden, config.kv_size, self.tp, local_range=(me.kv_start * d, me.kv_count * d), bias=config.qkv_bias, **kw
+        kv_part = (config.kv_size, me.kv_start * d, me.kv_count * d)
+        # Q, K and V in one GEMM (this rank's heads only)
+        self.qkv_proj = FusedColumnParallelLinear(
+            hidden, [(config.q_size, me.q_start * d, me.q_count * d), kv_part, kv_part], self.tp, bias=config.qkv_bias, **kw
         )
         self.o_proj = RowParallelLinear(
             config.q_size, hidden, self.tp, sizes=[s.q_count * d for s in tp_shards], bias=config.o_bias, **kw
         )
-        self.register_buffer("kv_map", torch.tensor(me.kv_map, dtype=torch.long, device=device), persistent=False)
+        # query->KV head map; None when heads are regularly grouped (fused GQA kernels)
+        self.kv_map = self._kv_map_arg(me, device)
         self.ulysses_shards: Optional[List[HeadShard]] = None
         if self.sp.size > 1 and sp_mode == "ulysses":
             self.ulysses_shards = partition_heads(
                 me.q_count, me.kv_count, list(sp_weights) if sp_weights else self.sp.size, kv_map=me.kv_map
             )
-            local = self.ulysses_shards[self.sp.rank]
-            self.register_buffer(
-                "ulysses_kv_map", torch.tensor(local.kv_map, dtype=torch.long, device=device), persistent=False
-            )
+            self.ulysses_kv_map = self._kv_map_arg(self.ulysses_shards[self.sp.rank], device)
+        # heads whose output projection this SP rank computes when decoding with sp_split
+        self.sp_split_heads: Optional[tuple] = None
+        if self.sp.size > 1:
+            if self.ulysses_shards is not None:
+                mine = self.ulysses_shards[self.sp.rank]
+                self.sp_split_heads = (mine.q_start, mine.q_count)
+            elif me.q_count >= self.sp.size:
+                sizes = split_sizes(me.q_count, list(sp_weights) if sp_weights else self.sp.size)
+                self.sp_split_heads = (offsets_of(sizes)[self.sp.rank], sizes[self.sp.rank])
+
+    @staticmethod
+    def _kv_map_arg(shard: HeadShard, device) -> Optional[torch.Tensor]:
+        if gqa_group(shard.q_count, shard.kv_count, shard.kv_map) is not None:
+            return None
+        return torch.tensor(shard.kv_map, dtype=torch.long, device=device)
 
     def forward(
         self,
@@ -139,12 +149,15 @@ class ParallelAttention(nn.Module):
         cache: Optional[LayerKVCache],
         rotary: RotaryEmbedding,
     ) -> torch.Tensor:
+        if state.sp_split and self.sp_split_heads is not None:
+            return self._forward_sp_split(x, state, cache, rotary)
         B, S, _ = x.shape
         d = self.head_dim
-        q = self.q_proj(x).view(B, S, self.num_q, d)
-        k = self.k_proj(x).view(B, S, self.num_kv, d)
-        v = self.v_proj(x).view(B, S, self.num_kv, d)
-        cos, sin = rotary(state.positions, q.dtype)
+        q, k, v = self.qkv_proj(x)
+        q = q.view(B, S, self.num_q, d)
+        k = k.view(B, S, self.num_kv, d)
+        v = v.view(B, S, self.num_kv, d)
+        cos, sin = self._rope(state, q.dtype, rotary)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         out = self._attend(q, k, v, state, cache)
         return self.o_proj(
@@ -153,6 +166,58 @@ class ParallelAttention(nn.Module):
             scatter_dim=1,
             scatter_sizes=state.tp_sp_sizes,
         )
+
+    @staticmethod
+    def _rope(state: ForwardState, dtype: torch.dtype, rotary: RotaryEmbedding):
+        if state.rope is None or state.rope[0].dtype != dtype:
+            state.rope = rotary(state.positions, dtype)  # shared by all layers of this pass
+        return state.rope
+
+    def _qkv_rows(self, x: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        """Rows ``[start, end)`` of the fused Q/K/V projection (a view, no copy)."""
+        bias = self.qkv_proj.bias
+        return F.linear(x, self.qkv_proj.weight[start:end], None if bias is None else bias[start:end])
+
+    def _forward_sp_split(self, x, state: ForwardState, cache: Optional[LayerKVCache], rotary) -> torch.Tensor:
+        """Replicated tokens: SP ranks share the work of this layer (decode)."""
+        B, S, _ = x.shape
+        d, pos, sp = self.head_dim, state.positions, self.sp
+        kw = dict(causal=True, kv_block=self.kv_block)
+        cos, sin = self._rope(state, x.dtype, rotary)
+        q_rows, kv_rows = self.num_q * d, self.num_kv * d
+        head_start, head_count = self.sp_split_heads
+        if self.ulysses_shards is not None:
+            # this rank attends for its heads only, so it only projects those heads
+            me = self.ulysses_shards[sp.rank]
+            kv_lo, kv_hi = me.kv_start * d, (me.kv_start + me.kv_count) * d
+            q = self._qkv_rows(x, me.q_start * d, (me.q_start + me.q_count) * d).view(B, S, me.q_count, d)
+            k = self._qkv_rows(x, q_rows + kv_lo, q_rows + kv_hi).view(B, S, me.kv_count, d)
+            v = self._qkv_rows(x, q_rows + kv_rows + kv_lo, q_rows + kv_rows + kv_hi).view(B, S, me.kv_count, d)
+            q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+            kpos = pos
+            if cache is not None:
+                cache.append(k, v, pos)
+                k, v, kpos = cache.view()
+            local = attention(q, k, v, pos, kpos, kv_map=self.ulysses_kv_map, **kw)
+        else:
+            # ring: every rank needs all query heads; only the cache owner needs K/V
+            owner = cache is None or state.decode_owner == sp.rank
+            q = apply_rotary(self._qkv_rows(x, 0, q_rows).view(B, S, self.num_q, d), cos, sin)
+            if owner:
+                k, v = self._qkv_rows(x, q_rows, q_rows + 2 * kv_rows).view(B, S, 2 * self.num_kv, d).split(self.num_kv, dim=2)
+                k = apply_rotary(k, cos, sin)
+            if cache is None:
+                out = attention(q, k, v, pos, pos, kv_map=self.kv_map, **kw)
+            else:
+                if owner:
+                    cache.append(k, v, pos)
+                kc, vc, pc = cache.view(like_k=q.new_empty(B, 0, self.num_kv, d), like_pos=pos)
+                out = distributed_kv_attention(q, kc, vc, pos, pc, sp, kv_map=self.kv_map, **kw)
+            local = out[:, :, head_start : head_start + head_count]
+        # each rank projects its heads; one all-reduce over the stage sums SP and TP partials
+        weight = self.o_proj.weight[:, head_start * d : (head_start + head_count) * d]
+        out = self.stage.all_reduce(F.linear(local.reshape(B, S, head_count * d), weight))
+        return out if self.o_proj.bias is None else out + self.o_proj.bias
 
     def _attend(self, q, k, v, state: ForwardState, cache: Optional[LayerKVCache]) -> torch.Tensor:
         pos, sp = state.positions, self.sp
@@ -172,13 +237,13 @@ class ParallelAttention(nn.Module):
                 if cache is not None:
                     cache.append(k, v, pos)  # KV cache stays sharded along the sequence
                 return out
-            past = cache.view() if cache is not None and len(cache) > 0 else None
-            out, (k_heads, v_heads, pos_all) = ulysses_attention(
-                q, k, v, pos, sp, state.sp_sizes, self.ulysses_shards, past=past, **kw
-            )
-            if cache is not None:
-                cache.append(k_heads, v_heads, pos_all)  # KV cache sharded along heads
-            return out
+            q_h, k_h, v_h, pos_all = ulysses_scatter(q, k, v, pos, sp, state.sp_sizes, self.ulysses_shards)
+            k_att, v_att, p_att = k_h, v_h, pos_all
+            if cache is not None:  # KV cache sharded along heads; attend to it in place
+                cache.append(k_h, v_h, pos_all)
+                k_att, v_att, p_att = cache.view()
+            local = attention(q_h, k_att, v_att, pos_all, p_att, kv_map=self.ulysses_kv_map, **kw)
+            return ulysses_gather(local, sp, state.sp_sizes, self.ulysses_shards)
 
         # tokens replicated on every SP rank (decoding or very short inputs)
         if cache is None:
@@ -202,20 +267,55 @@ class ParallelAttention(nn.Module):
 
 
 class ParallelMLP(nn.Module):
-    def __init__(self, config: ModelConfig, ctx: ParallelContext, ffn_sizes: Sequence[int], dtype=None, device=None):
+    def __init__(
+        self,
+        config: ModelConfig,
+        ctx: ParallelContext,
+        ffn_sizes: Sequence[int],
+        dtype=None,
+        device=None,
+        sp_weights: Optional[Sequence[float]] = None,
+    ):
         super().__init__()
-        kw = dict(sizes=ffn_sizes, bias=config.mlp_bias, dtype=dtype, device=device)
         h, i = config.hidden_size, config.intermediate_size
-        self.gate_proj = ColumnParallelLinear(h, i, ctx.tp, **kw)
-        self.up_proj = ColumnParallelLinear(h, i, ctx.tp, **kw)
-        self.down_proj = RowParallelLinear(i, h, ctx.tp, **kw)
+        rank = ctx.tp.rank
+        self.stage = ctx.stage
+        self.local_units = ffn_sizes[rank]
+        # units of the TP-local MLP this SP rank computes when decoding with sp_split
+        self.sp_units: Optional[tuple] = None
+        if ctx.sp.size > 1 and self.local_units >= ctx.sp.size:
+            sizes = split_sizes(self.local_units, list(sp_weights) if sp_weights else ctx.sp.size)
+            self.sp_units = (offsets_of(sizes)[ctx.sp.rank], sizes[ctx.sp.rank])
+        part = (i, offsets_of(ffn_sizes)[rank], ffn_sizes[rank])
+        # gate and up projections in one GEMM
+        self.gate_up_proj = FusedColumnParallelLinear(
+            h, [part, part], ctx.tp, bias=config.mlp_bias, dtype=dtype, device=device
+        )
+        self.down_proj = RowParallelLinear(
+            i, h, ctx.tp, sizes=ffn_sizes, bias=config.mlp_bias, dtype=dtype, device=device
+        )
         if config.hidden_act not in _ACTIVATIONS:
             raise NotImplementedError(f"activation {config.hidden_act!r} is not supported")
         self.act = _ACTIVATIONS[config.hidden_act]
 
     def forward(self, x: torch.Tensor, state: ForwardState) -> torch.Tensor:
-        h = self.act(self.gate_proj(x)) * self.up_proj(x)
+        if state.sp_split and self.sp_units is not None:
+            return self._forward_sp_split(x)
+        gate, up = self.gate_up_proj(x)
+        h = self.act(gate) * up
         return self.down_proj(h, reduce=state.tp_reduce, scatter_dim=1, scatter_sizes=state.tp_sp_sizes)
+
+    def _forward_sp_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Replicated tokens: each SP rank computes a slice of the units (views, no copies)."""
+        start, count = self.sp_units
+        units = self.local_units
+        weight, bias = self.gate_up_proj.weight, self.gate_up_proj.bias
+        gate = F.linear(x, weight[start : start + count], None if bias is None else bias[start : start + count])
+        up_lo = units + start
+        up = F.linear(x, weight[up_lo : up_lo + count], None if bias is None else bias[up_lo : up_lo + count])
+        partial = F.linear(self.act(gate) * up, self.down_proj.weight[:, start : start + count])
+        out = self.stage.all_reduce(partial)  # sums SP and TP partials at once
+        return out if self.down_proj.bias is None else out + self.down_proj.bias
 
 
 class DecoderLayer(nn.Module):
@@ -227,7 +327,7 @@ class DecoderLayer(nn.Module):
             config, ctx, tp_shards, sp_mode=sp_mode, sp_weights=sp_weights, kv_block=kv_block, dtype=dtype, device=device
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, dtype, device)
-        self.mlp = ParallelMLP(config, ctx, ffn_sizes, dtype, device)
+        self.mlp = ParallelMLP(config, ctx, ffn_sizes, dtype, device, sp_weights=sp_weights)
 
     def _gather(self, h: torch.Tensor, state: ForwardState) -> torch.Tensor:
         if state.tp_sp_sizes:  # Megatron SP: norms ran on 1/tp of the tokens
@@ -324,13 +424,18 @@ class LlamaStage(nn.Module):
         for idx, layer in self.layers.items():
             p = f"model.layers.{idx}."
             attn, mlp = layer.self_attn, layer.mlp
-            for proj in ("q_proj", "k_proj", "v_proj"):
-                getattr(attn, proj).load_full(
-                    source.get(p + f"self_attn.{proj}.weight"), bias(p + f"self_attn.{proj}.bias", cfg.qkv_bias)
-                )
+            qkv = ("q_proj", "k_proj", "v_proj")
+            attn.qkv_proj.load_full(
+                [source.get(p + f"self_attn.{n}.weight") for n in qkv],
+                [bias(p + f"self_attn.{n}.bias", cfg.qkv_bias) for n in qkv],
+            )
             attn.o_proj.load_full(source.get(p + "self_attn.o_proj.weight"), bias(p + "self_attn.o_proj.bias", cfg.o_bias))
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                getattr(mlp, proj).load_full(source.get(p + f"mlp.{proj}.weight"), bias(p + f"mlp.{proj}.bias", cfg.mlp_bias))
+            gate_up = ("gate_proj", "up_proj")
+            mlp.gate_up_proj.load_full(
+                [source.get(p + f"mlp.{n}.weight") for n in gate_up],
+                [bias(p + f"mlp.{n}.bias", cfg.mlp_bias) for n in gate_up],
+            )
+            mlp.down_proj.load_full(source.get(p + "mlp.down_proj.weight"), bias(p + "mlp.down_proj.bias", cfg.mlp_bias))
             layer.input_layernorm.weight.copy_(source.get(p + "input_layernorm.weight"))
             layer.post_attention_layernorm.weight.copy_(source.get(p + "post_attention_layernorm.weight"))
         if self.has_head:
