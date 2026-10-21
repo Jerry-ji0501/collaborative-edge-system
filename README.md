@@ -1,90 +1,105 @@
-# collab-infer：面向边缘设备的通用协同推理框架
+# collab-infer: a general collaborative inference framework for edge devices
 
-`collab_infer` 让多台（可能异构的）边缘设备协同完成一个模型的推理，支持三种并行方式及其任意组合：
+[![CI](https://github.com/Jerry-ji0501/collaborative-edge-system/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-ji0501/collaborative-edge-system/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-| 并行方式 | 切分对象 | 通信 | 主要收益 |
+English | [简体中文](README.zh-CN.md)
+
+`collab_infer` lets several (possibly heterogeneous) edge devices run inference for one model together. It supports three kinds of parallelism and any combination of them:
+
+| Parallelism | What is split | Communication | Main benefit |
 | --- | --- | --- | --- |
-| **张量并行 TP**（Megatron-LM 风格） | 每层的权重矩阵（注意力头 / MLP 单元 / 词表） | 每层 2 次 all-reduce（可选 Megatron-SP：reduce-scatter + all-gather） | 单层计算与权重内存按设备数切分，时延最低（需要高速链路） |
-| **流水线并行 PP** | 连续的层 → 连续的设备（stage） | 仅在 stage 边界点对点传输激活 | 通信量最小，适合 Wi‑Fi 等弱网络；micro-batch 让所有 stage 同时工作 |
-| **序列并行 SP**（Ring Attention / DeepSpeed‑Ulysses） | 序列中的 token | Ring：KV 块环形传递（与计算重叠）；Ulysses：2 次 all-to-all | 长上下文 prefill 加速，**KV Cache 分布在多台设备上**，突破单设备内存限制 |
+| **Tensor parallelism, TP** (Megatron-LM style) | The weight matrices of every layer (attention heads / MLP units / vocabulary) | 2 all-reduces per layer (optionally Megatron-SP: reduce-scatter + all-gather) | Per-layer compute and weight memory are divided across devices; lowest latency (needs a fast link) |
+| **Pipeline parallelism, PP** | Consecutive layers → consecutive devices (stages) | Point-to-point activation transfers at stage boundaries only | Least traffic, suited to weak networks such as Wi‑Fi; micro-batches keep every stage busy |
+| **Sequence parallelism, SP** (Ring Attention / DeepSpeed‑Ulysses) | The tokens of the sequence | Ring: KV blocks passed around a ring (overlapped with compute); Ulysses: 2 all-to-alls | Faster long-context prefill; **the KV cache is spread over several devices**, lifting the single-device memory limit |
 
-三者构成一个 `pp × sp × tp` 的 3D 设备网格，可以任意组合（如 `pp=2, sp=2, tp=2` 共 8 台设备）。所有维度都支持**按设备能力的非均匀切分**（异构边缘集群），并提供**自动规划器**、**网络模拟器**和**通信统计**。
+Together they form a `pp × sp × tp` 3D device mesh and can be combined freely (for example `pp=2, sp=2, tp=2` for 8 devices). Every dimension supports **uneven splits weighted by device capability** (heterogeneous edge clusters), and the framework ships an **automatic planner**, a **network simulator** and **communication statistics**.
 
-> 正确性：测试套件在 float64 下将 37 种并行配置（含所有组合、非均匀切分、zigzag、Megatron-SP、GQA/MQA、padding、分块流水 prefill、SP 解码拆分、EOS、采样）与一个独立实现的单设备参考模型逐 logit 比较（误差 ~1e-16），并与 Hugging Face `transformers` 的 LLaMA / Qwen2 实现对齐（float32 误差 ~2e-7）。
-
----
-
-## 目录
-
-- [架构](#架构)
-- [安装](#安装)
-- [快速开始](#快速开始)
-- [在多台真实设备上部署](#在多台真实设备上部署)
-- [加载 Hugging Face 模型](#加载-hugging-face-模型)
-- [异构集群与自动规划](#异构集群与自动规划)
-- [在自定义模型上使用并行原语](#在自定义模型上使用并行原语)
-- [网络模拟与策略对比](#网络模拟与策略对比)
-- [推理优化](#推理优化)
-- [配置参考](#配置参考)
-- [关键设计](#关键设计)
-- [测试](#测试)
-- [局限与后续工作](#局限与后续工作)
+> Correctness: in float64, the test suite compares 37 parallel configurations (all combinations, uneven splits, zigzag, Megatron-SP, GQA/MQA, padding, chunked pipelined prefill, SP decode split, EOS, sampling) logit by logit against an independently written single-device reference model (error ~1e-16), and checks parity with the Hugging Face `transformers` LLaMA / Qwen2 implementations (float32 error ~2e-7).
 
 ---
 
-## 架构
+## Contents
+
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Deploying on multiple real devices](#deploying-on-multiple-real-devices)
+- [Loading Hugging Face models](#loading-hugging-face-models)
+- [Heterogeneous clusters and automatic planning](#heterogeneous-clusters-and-automatic-planning)
+- [Using the parallel primitives on your own models](#using-the-parallel-primitives-on-your-own-models)
+- [Network simulation and strategy comparison](#network-simulation-and-strategy-comparison)
+- [Inference optimizations](#inference-optimizations)
+- [Configuration reference](#configuration-reference)
+- [Key design decisions](#key-design-decisions)
+- [Tests](#tests)
+- [Limitations and future work](#limitations-and-future-work)
+- [Repository layout](#repository-layout)
+- [License](#license)
+
+---
+
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ planner/     设备画像 → TP/SP 权重、PP 层划分（DP）、代价模型、策略搜索    │
+│ planner/     device profiles → TP/SP weights, PP layer split (DP),   │
+│              cost model, strategy search                             │
 ├──────────────────────────────────────────────────────────────────────┤
-│ engine/      CollabEngine：prefill / decode / 生成调度（micro-batch 流水、 │
-│              token 回环、STOP 控制消息）、采样                            │
+│ engine/      CollabEngine: prefill / decode / generation scheduling  │
+│              (micro-batch pipelining, token loop-back, STOP control  │
+│              messages), sampling                                     │
 ├──────────────────────────────────────────────────────────────────────┤
-│ models/      并行化的 LLaMA 系列模型（LLaMA / Mistral / Qwen2）、KV Cache、 │
-│              按分片加载权重（state dict / torch mmap / safetensors / HF） │
+│ models/      parallelized LLaMA-family models (LLaMA / Mistral /     │
+│              Qwen2), KV cache, sharded weight loading (state dict /  │
+│              torch mmap / safetensors / HF)                          │
 ├──────────────────────────────────────────────────────────────────────┤
-│ parallel/    模型无关的并行原语                                          │
-│   tensor_parallel   Column/Row/VocabParallel 层、parallelize_module     │
-│   sequence_parallel ring_attention、ulysses_attention、分布式 KV 解码     │
-│   pipeline_parallel P2PChannel、PipelineRunner、split_sequential         │
-│   attention         带 log-sum-exp 的注意力核与精确合并                   │
-│   partition         加权切分、GQA 感知的注意力头划分、序列布局              │
+│ parallel/    model-agnostic parallel primitives                      │
+│   tensor_parallel   Column/Row/VocabParallel layers,                 │
+│                     parallelize_module                               │
+│   sequence_parallel ring_attention, ulysses_attention,               │
+│                     distributed KV decoding                          │
+│   pipeline_parallel P2PChannel, PipelineRunner, split_sequential     │
+│   attention         attention kernels with log-sum-exp and exact     │
+│                     merging                                          │
+│   partition         weighted splits, GQA-aware head partitioning,    │
+│                     sequence layouts                                 │
 ├──────────────────────────────────────────────────────────────────────┤
-│ distributed/ ParallelContext（3D 网格与通信组）、Communicator（非均匀集合 │
-│              通信、gloo 回退实现、统计、网络模拟）、launcher                 │
+│ distributed/ ParallelContext (3D mesh and process groups),           │
+│              Communicator (uneven collectives, gloo fallbacks,       │
+│              statistics, network simulation), launcher               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-全局 rank 与网格坐标的映射为 `rank = (pp_rank * sp + sp_rank) * tp + tp_rank`，TP 组（通信最频繁）的 rank 相邻。每个进程只构建并加载**属于自己的那一份模型**：自己 stage 的层、自己 TP 分片的权重。
+Global ranks map to mesh coordinates as `rank = (pp_rank * sp + sp_rank) * tp + tp_rank`, so the members of a TP group (which communicates most often) have adjacent ranks. Each process builds and loads **only its own share of the model**: the layers of its stage and its TP shard of their weights.
 
 ---
 
-## 安装
+## Installation
 
 ```bash
-pip install -e .            # 依赖：torch >= 2.1
-pip install -e ".[hf,test]" # 可选：加载 HF 模型 / 分词器（transformers、safetensors）及测试
+pip install -e .            # requires torch >= 2.1
+pip install -e ".[hf,test]" # optional: load HF models / tokenizers (transformers, safetensors) and run the tests
 ```
 
-纯 CPU 的边缘设备（树莓派、ARM 开发板等）使用 `gloo` 后端即可；GPU 设备可用 `nccl`，GPU 与 CPU 混合集群使用 `gloo`（通信时自动在主存中中转）。
+CPU-only edge devices (Raspberry Pi, ARM boards, ...) use the `gloo` backend. GPU devices can use `nccl`; mixed GPU/CPU clusters use `gloo` (tensors are staged through host memory automatically).
 
 ---
 
-## 快速开始
+## Quick start
 
-### 1. 命令行：在一台机器上模拟多设备集群
+### 1. Command line: simulate a multi-device cluster on one machine
 
 ```bash
-# 8 个进程模拟 8 台设备：2 个流水线 stage × 2 路序列并行 × 2 路张量并行
+# 8 processes simulate 8 devices: 2 pipeline stages × 2-way sequence parallel × 2-way tensor parallel
 python -m collab_infer generate --nproc 8 --pp 2 --sp 2 --tp 2 \
     --sp-layout zigzag --megatron-sp --token-ids "1,2,3,4;5,6" --max-new-tokens 8
 
-# 同时模拟 100 Mbps / 2 ms 的 Wi‑Fi 链路
+# Also simulate a 100 Mbps / 2 ms Wi‑Fi link
 python -m collab_infer generate --nproc 4 --tp 2 --pp 2 --bandwidth-mbps 100 --latency-ms 2
 ```
 
-输出包含生成结果、首 token 时延、解码速度，以及每个 rank 的层范围、参数量、KV Cache 大小和通信量：
+The output contains the generated tokens, time to first token, decode speed, and for every rank its layer range, parameter size, KV cache size and traffic:
 
 ```
 rank  (pp,sp,tp)       layers  params MB    KV MB   sent MB   calls
@@ -99,81 +114,81 @@ rank  (pp,sp,tp)       layers  params MB    KV MB   sent MB   calls
 import torch
 from collab_infer import CollabEngine, ModelConfig, ParallelConfig, launch_local, random_state_dict
 
-MODEL = ModelConfig.tiny()          # 或 ModelConfig.from_hf("/path/to/hf-model")
+MODEL = ModelConfig.tiny()          # or ModelConfig.from_hf("/path/to/hf-model")
 
 def run(rank, world_size):
     engine = CollabEngine(
         MODEL,
         ParallelConfig(pp_size=2, sp_size=1, tp_size=2),
-        random_state_dict(MODEL),   # 或 checkpoint 路径 / HF 目录：每个 rank 只读取自己的分片
+        random_state_dict(MODEL),   # or a checkpoint path / HF directory: each rank reads only its own shard
     )
     result = engine.generate([[1, 5, 9, 14], [2, 4, 8]] if rank == 0 else None, max_new_tokens=16)
-    return result.tokens            # 所有 rank 上结果相同
+    return result.tokens            # identical on every rank
 
 print(launch_local(run, world_size=4, return_results=True)[0])
 ```
 
-`CollabEngine` 采用 SPMD 方式：每个 rank 构造同一个引擎、调用同一个方法；输入从 rank 0 读取并广播，结果在所有 rank 上返回。
+`CollabEngine` is SPMD: every rank constructs the same engine and calls the same method. Inputs are read on rank 0 and broadcast; results are returned on every rank.
 
-- `engine.generate(prompts, max_new_tokens, sampling=SamplingParams(...), eos_token_id=..., return_scores=...)`：批量生成，prompt 长度可不同（自动左填充）。
-- `engine.forward(input_ids, attention_mask, broadcast=True)`：返回所有位置的 logits。
-- `engine.comm_stats`、`engine.memory_report()`、`engine.last_kv_cache_bytes`：通信与内存统计。
+- `engine.generate(prompts, max_new_tokens, sampling=SamplingParams(...), eos_token_id=..., return_scores=...)`: batched generation; prompts may have different lengths (left-padded automatically).
+- `engine.forward(input_ids, attention_mask, broadcast=True)`: returns the logits for every position.
+- `engine.comm_stats`, `engine.memory_report()`, `engine.last_kv_cache_bytes`: communication and memory statistics.
 
-更多示例见 [`examples/quickstart.py`](examples/quickstart.py)。
+More examples in [`examples/quickstart.py`](examples/quickstart.py).
 
 ---
 
-## 在多台真实设备上部署
+## Deploying on multiple real devices
 
-每台设备运行**同一条命令**，通过 `torchrun` 或环境变量加入集群（rank 0 所在设备作为 master）：
+Every device runs **the same command** and joins the cluster through `torchrun` or environment variables (the device hosting rank 0 is the master):
 
 ```bash
-# 设备 A（192.168.1.10，node_rank=0）
+# Device A (192.168.1.10, node_rank=0)
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr=192.168.1.10 --master_port=29500 \
-    -m collab_infer generate --model /models/TinyLlama-1.1B --pp 2 --prompt "你好"
+    -m collab_infer generate --model /models/TinyLlama-1.1B --pp 2 --prompt "Hello"
 
-# 设备 B（node_rank=1）
+# Device B (node_rank=1)
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
     --master_addr=192.168.1.10 --master_port=29500 \
-    -m collab_infer generate --model /models/TinyLlama-1.1B --pp 2 --prompt "你好"
+    -m collab_infer generate --model /models/TinyLlama-1.1B --pp 2 --prompt "Hello"
 ```
 
-不使用 torchrun 时，设置 `RANK`、`WORLD_SIZE`、`MASTER_ADDR`、`MASTER_PORT` 后直接运行 `python -m collab_infer generate ...`。在自己的脚本中调用 `collab_infer.init_distributed()` 即可。
+Without torchrun, set `RANK`, `WORLD_SIZE`, `MASTER_ADDR` and `MASTER_PORT` and run `python -m collab_infer generate ...` directly. From your own scripts, call `collab_infer.init_distributed()`.
 
-提示：
-- 多网卡设备请设置 `GLOO_SOCKET_IFNAME=wlan0`（或 `eth0`），让 gloo 绑定到能互通的网卡。
-- 设备间 PyTorch 版本不一致时，可设置 `COLLAB_INFER_COMM_FALLBACK=1`，统一使用基于点对点的 all-to-all / reduce-scatter 实现。
+Tips:
+- On devices with several network interfaces, set `GLOO_SOCKET_IFNAME=wlan0` (or `eth0`) so that gloo binds to an interface the other devices can reach.
+- If the devices run different PyTorch versions, set `COLLAB_INFER_COMM_FALLBACK=1` to use the point-to-point implementations of all-to-all / reduce-scatter everywhere.
 
 ---
 
-## 加载 Hugging Face 模型
+## Loading Hugging Face models
 
-支持 `llama`、`mistral`、`qwen2` 架构（GQA、QKV bias、tied embedding、`linear` / `llama3` RoPE scaling）：
+The `llama`, `mistral` and `qwen2` architectures are supported (GQA, QKV bias, tied embeddings, `linear` / `llama3` RoPE scaling):
 
 ```python
-cfg = ModelConfig.from_hf("/models/Qwen2-0.5B")                 # 读取 config.json
-engine = CollabEngine(cfg, ParallelConfig(tp_size=2), "/models/Qwen2-0.5B")  # 读取 safetensors / .bin（含分片 index）
+cfg = ModelConfig.from_hf("/models/Qwen2-0.5B")                 # reads config.json
+engine = CollabEngine(cfg, ParallelConfig(tp_size=2), "/models/Qwen2-0.5B")  # reads safetensors / .bin (including sharded indexes)
 ```
 
-权重按 HF 参数名读取，每个 rank 只取自己需要的切片；`torch.save` 格式的权重以 mmap 方式打开，内存受限的设备只会触及自己分片所在的页。
+Weights are read by their HF parameter names and each rank takes only the slices it needs. Weights in `torch.save` format are opened with mmap, so a memory-constrained device only touches the pages that hold its own shard.
 
 ---
 
-## 异构集群与自动规划
+## Heterogeneous clusters and automatic planning
 
-边缘集群往往由算力、内存差别很大的设备组成。所有切分都可以按权重进行：
+Edge clusters often mix devices with very different compute and memory. Every split can be weighted:
 
 ```python
 ParallelConfig(
-    tp_size=2, tp_weights=[3, 1],        # 快设备分到 3/4 的注意力头和 MLP 单元
-    sp_size=2, sp_weights=[2, 1],        # 快设备处理 2/3 的 token
-    pp_size=2, pp_layers=[20, 12],       # 每个 stage 的层数
+    tp_size=2, tp_weights=[3, 1],        # the fast device gets 3/4 of the attention heads and MLP units
+    sp_size=2, sp_weights=[2, 1],        # the fast device handles 2/3 of the tokens
+    pp_size=2, pp_layers=[20, 12],       # number of layers per stage
 )
-# tp_weights 也可以按 stage 分别指定：[[3, 1], [1, 1]]
+# tp_weights can also be given per stage: [[3, 1], [1, 1]]
 ```
 
-规划器根据设备画像自动给出这些参数，并用解析代价模型对所有 `pp × sp × tp` 组合排序：
+The planner derives these parameters from device profiles and ranks every `pp × sp × tp` combination with an analytical cost model:
 
 ```python
 from collab_infer.planner import DeviceProfile, Workload, plan, search
@@ -185,14 +200,14 @@ devices = [
     DeviceProfile("rpi5-b",      tflops=0.1, memory_gb=4,  mem_bandwidth_gbps=10),
 ]
 model = ModelConfig.preset("tinyllama-1.1b")
-print(plan(model, devices, pp_size=4).pp_layers)      # [14, 6, 1, 1]：动态规划最小化最慢 stage，满足内存约束
+print(plan(model, devices, pp_size=4).pp_layers)      # [14, 6, 1, 1]: dynamic programming minimizes the slowest stage under memory constraints
 for r in search(model, devices, Workload(prompt_len=1024, new_tokens=64), top_k=3):
     print(r)
 ```
 
-命令行：`python -m collab_infer plan --preset tinyllama-1.1b --devices devices.json`（`devices.json` 为 `DeviceProfile` 字段列表）。
+Command line: `python -m collab_infer plan --preset tinyllama-1.1b --devices devices.json` (`devices.json` is a list of `DeviceProfile` fields).
 
-[`examples/heterogeneous_edge.py`](examples/heterogeneous_edge.py) 用不同的 CPU 线程数在一台机器上模拟快/慢两台设备（实测 363 vs 132 GFLOP/s），先测算力再交给规划器，比较均匀切分与规划切分：
+[`examples/heterogeneous_edge.py`](examples/heterogeneous_edge.py) simulates a fast and a slow device on one machine by giving them different CPU thread counts (measured 363 vs 132 GFLOP/s). It measures their compute first, hands the numbers to the planner, and compares an even split with the planned split:
 
 ```
 case               TTFT s  total s  partition
@@ -202,13 +217,13 @@ PP2 even            1.050    1.220  even
 PP2 planned         0.830    0.976  [6, 2]
 ```
 
-（两种切分的生成结果完全相同；数据来自 4 核 CPU 容器，仅供参考。）
+(Both splits generate exactly the same tokens. Numbers come from a 4-core CPU container and are only indicative.)
 
 ---
 
-## 在自定义模型上使用并行原语
+## Using the parallel primitives on your own models
 
-`parallel/` 中的原语与模型无关，可直接用于你自己的模型（见 [`examples/custom_models.py`](examples/custom_models.py)）：
+The primitives in `parallel/` are model-agnostic and work on your own models directly (see [`examples/custom_models.py`](examples/custom_models.py)):
 
 ```python
 from collab_infer import ParallelContext
@@ -216,30 +231,30 @@ from collab_infer.parallel import (ColwiseParallel, RowwiseParallel, parallelize
                                    PipelineRunner, split_sequential,
                                    SequenceLayout, ring_attention, gather_sequence)
 
-# 张量并行：按名字模式切分任意模型的 nn.Linear / nn.Embedding
+# Tensor parallelism: shard the nn.Linear / nn.Embedding layers of any model by name pattern
 ctx = ParallelContext(tp_size=2)
 parallelize_module(block, ctx.tp, {
-    "qkv.*": ColwiseParallel(granularity=head_dim),   # 按整头切分
+    "qkv.*": ColwiseParallel(granularity=head_dim),   # split on whole heads
     "proj":  RowwiseParallel(granularity=head_dim),
     "fc1":   ColwiseParallel(), "fc2": RowwiseParallel(),
 })
 
-# 流水线并行：把 CNN 等顺序模型切成 stage，micro-batch 流水执行
+# Pipeline parallelism: cut a sequential model such as a CNN into stages and pipeline micro-batches through them
 ctx = ParallelContext(pp_size=3)
 stage = split_sequential(list(cnn), ctx.pp, layer_counts=[3, 3, 5])
 logits = PipelineRunner(stage, ctx.pp).forward(images, num_microbatches=4, return_to="first")
 
-# 序列并行：在自定义注意力中用 ring_attention 替换稠密注意力
+# Sequence parallelism: replace dense attention with ring_attention in your own attention module
 out = ring_attention(q, k, v, q_pos, k_pos, ctx.sp, layout.sizes, causal=False)
 ```
 
 ---
 
-## 网络模拟与策略对比
+## Network simulation and strategy comparison
 
-`NetworkConfig(bandwidth_mbps, latency_ms)` 为每次通信加上 `延迟 × 步数 + 字节数 / 带宽` 的时间（流水线消息在链路上排队，ring attention 的传输与计算重叠），可在单机上评估不同网络条件下的策略。[`examples/benchmark_strategies.py`](examples/benchmark_strategies.py) 在 4 个模拟设备上对比各策略（8 层、hidden 256 的模型，batch 2，prompt 256，生成 16 个 token）：
+`NetworkConfig(bandwidth_mbps, latency_ms)` adds `latency × steps + bytes / bandwidth` to every communication (pipeline messages queue on the link; ring attention transfers overlap with compute), so strategies can be evaluated under different network conditions on a single machine. [`examples/benchmark_strategies.py`](examples/benchmark_strategies.py) compares strategies on 4 simulated devices (8 layers, hidden size 256, batch 2, 256-token prompt, 16 generated tokens).
 
-无网络限制（本机回环）：
+No network limit (local loopback):
 
 ```
 strategy         TTFT s  decode tok/s  total s  max sent MB  max KV MB  max param MB
@@ -252,7 +267,7 @@ SP2xTP2           0.125          45.1    0.790         6.17       1.11         1
 PP2xSP2           0.062          57.7    0.582         1.49       1.11         13.71
 ```
 
-模拟 100 Mbps / 5 ms 的 Wi‑Fi：
+Simulated 100 Mbps / 5 ms Wi‑Fi:
 
 ```
 strategy         TTFT s  decode tok/s  total s  max sent MB  max KV MB  max param MB
@@ -265,118 +280,128 @@ SP2xTP2           0.722          12.7    3.082         6.17       1.11         1
 PP2xSP2           0.210          23.4    1.494         1.49       1.11         13.71
 ```
 
-可以看到边缘场景的典型取舍：TP 每层两次集合通信，对时延和带宽最敏感；PP 通信量最小，在弱网下最稳健；SP 把 KV Cache 均分到各设备（此处每设备 1/4），但权重在 SP 组内是复制的（param MB 更大），因此通常与 TP/PP 组合使用。
+These show the typical edge trade-offs: TP runs two collectives per layer and is the most sensitive to latency and bandwidth; PP moves the least data and is the most robust on weak networks; SP spreads the KV cache evenly across devices (1/4 per device here), but weights are replicated within the SP group (hence the larger param MB), so it is usually combined with TP/PP.
 
 ---
 
-## 推理优化
+## Inference optimizations
 
-下表是同一台 4 核 x86 CPU、同一会话中，对同一模型和请求在优化前（[PR #1](https://github.com/Jerry-ji0501/collaborative-edge-system/pull/1) 合并时的版本）与当前版本的对比：hidden 1024、8 层、GQA 16/4 头、3.2 万词表（1.23 亿参数，float32），单条 1024 token 的 prompt，生成 32 个 token，贪心解码。每个模拟设备分配固定的 CPU 线程数，"@100Mbps/2ms" 表示用网络模拟器模拟的边缘链路。所有配置优化前后生成的 token 完全相同。
+The table compares the version at the time [PR #1](https://github.com/Jerry-ji0501/collaborative-edge-system/pull/1) was merged ("before") with the current version ("after"), on the same 4-core x86 CPU, in the same session, with the same model and request: hidden size 1024, 8 layers, GQA with 16/4 heads, a 32k vocabulary (123M parameters, float32), one 1024-token prompt, 32 generated tokens, greedy decoding. Each simulated device gets a fixed number of CPU threads; "@100Mbps/2ms" means the edge link is simulated with the network simulator. Every configuration generates exactly the same tokens before and after.
 
-| 场景 | 首 token 时延（优化前 → 优化后） | 解码 ms/token（优化前 → 优化后） | 每次生成每 rank 发送 MB（优化前 → 优化后） |
+| Scenario | Time to first token (before → after) | Decode ms/token (before → after) | MB sent per rank per generation (before → after) |
 | --- | --- | --- | --- |
-| single (4 threads) | 1376 → **701 ms**（2.0×） | 51.1 → **26.1**（2.0×） | 0.00 → 0.00 |
-| TP2 | 1479 → **744 ms**（2.0×） | 92.8 → **42.7**（2.2×） | 73.51 → 72.42 |
-| PP2 | 2525 → **1064 ms**（2.4×） | 75.7 → **52.1**（1.5×） | 4.27 → 4.27 |
-| SP2 ring | 1182 → **743 ms**（1.6×） | 85.9 → **53.0**（1.6×） | 8.96 → 8.96 |
-| SP2 ulysses | 1380 → **816 ms**（1.7×） | 77.7 → **59.6**（1.3×） | 21.27 → 21.27 |
-| PP4 (1 thread each) | 4769 → **1102 ms**（4.3×） | 125.5 → **76.5**（1.6×） | 4.27 → 4.27 |
-| TP2 @100Mbps/2ms | 7182 → **6597 ms**（1.1×） | 154.6 → **79.9**（1.9×） | 73.51 → 72.42 |
-| PP2 @100Mbps/2ms | 2951 → **1111 ms**（2.7×） | 78.3 → **55.3**（1.4×） | 4.27 → 4.27 |
-| SP2 ulysses @100Mbps/2ms | 3240 → **2529 ms**（1.3×） | 87.8 → **72.1**（1.2×） | 21.27 → 21.27 |
-| TP2 @100Mbps/2ms +fp16（新增选项） | 7182 → **3764 ms**（1.9×） | 154.6 → **78.9**（2.0×） | 73.51 → 36.21 |
-| SP2 ulysses @100Mbps/2ms +fp16（新增选项） | 3240 → **1695 ms**（1.9×） | 87.8 → **72.5**（1.2×） | 21.27 → 10.79 |
+| single (4 threads) | 1376 → **701 ms** (2.0×) | 51.1 → **26.1** (2.0×) | 0.00 → 0.00 |
+| TP2 | 1479 → **744 ms** (2.0×) | 92.8 → **42.7** (2.2×) | 73.51 → 72.42 |
+| PP2 | 2525 → **1064 ms** (2.4×) | 75.7 → **52.1** (1.5×) | 4.27 → 4.27 |
+| SP2 ring | 1182 → **743 ms** (1.6×) | 85.9 → **53.0** (1.6×) | 8.96 → 8.96 |
+| SP2 ulysses | 1380 → **816 ms** (1.7×) | 77.7 → **59.6** (1.3×) | 21.27 → 21.27 |
+| PP4 (1 thread each) | 4769 → **1102 ms** (4.3×) | 125.5 → **76.5** (1.6×) | 4.27 → 4.27 |
+| TP2 @100Mbps/2ms | 7182 → **6597 ms** (1.1×) | 154.6 → **79.9** (1.9×) | 73.51 → 72.42 |
+| PP2 @100Mbps/2ms | 2951 → **1111 ms** (2.7×) | 78.3 → **55.3** (1.4×) | 4.27 → 4.27 |
+| SP2 ulysses @100Mbps/2ms | 3240 → **2529 ms** (1.3×) | 87.8 → **72.1** (1.2×) | 21.27 → 21.27 |
+| TP2 @100Mbps/2ms +fp16 (new option) | 7182 → **3764 ms** (1.9×) | 154.6 → **78.9** (2.0×) | 73.51 → 36.21 |
+| SP2 ulysses @100Mbps/2ms +fp16 (new option) | 3240 → **1695 ms** (1.9×) | 87.8 → **72.5** (1.2×) | 21.27 → 10.79 |
 
-几点说明：TP2 在模拟链路上的 prefill 受带宽限制（每次生成约 72 MB 的 all-reduce 流量），不压缩时首 token 只快 1.1 倍，开启 `comm_dtype="float16"` 后快 1.9 倍；PP4 的首 token 时延主要得益于分块流水 prefill。
+Notes: on the simulated link, TP2 prefill is bandwidth-bound (about 72 MB of all-reduce traffic per generation), so without compression the first token is only 1.1× faster, and 1.9× faster with `comm_dtype="float16"`. The PP4 time-to-first-token gain comes mainly from chunked pipelined prefill.
 
-各项优化（除通信压缩外都是无损的）：
+The optimizations (all lossless except communication compression):
 
-| 优化 | 做法 | 效果 |
+| Optimization | How | Effect |
 | --- | --- | --- |
-| 注意力融合内核 | 使用 PyTorch SDPA / CPU flash kernel；位置允许时不构造掩码，GQA 不复制 K/V | 1024 token 时注意力快 11–23 倍；单设备 prefill 中注意力占比从约 60% 降到约 16% |
-| KV Cache 按 head 连续存储 | 缓存存为 `[B, H, T, D]`，对外仍是 token-major 视图 | 解码读取缓存无需拷贝，长上下文解码注意力约快 30% |
-| 融合投影 | Q/K/V、gate/up 各合成一次 GEMM；RoPE 每次前向只算一次 | prefill 的投影 GEMM 快 6–22% |
-| 小消息直接交换 | ≤64 KiB 的 all-reduce / all-gather / broadcast 一跳直接交换，按 rank 顺序求和 | 解码时的集合通信延迟约降到 1/3，结果逐位一致；代价是多于 2 个 rank 时 all-reduce 发送的字节更多（4 个 rank 时约为 ring 的 2 倍） |
-| SP 解码拆分（`sp_decode_split`，可选，默认关闭） | 解码时 SP 各 rank 分担 MLP 和注意力输出投影，TP 与 SP 的归约合并为一次 stage 级 all-reduce | 减少重复计算，但每层多 1–2 次集合通信：本机回环下 Ulysses 解码约快 10–30%，模拟 100 Mbps/5 ms 链路下反而慢 1.35–2.2 倍，因此默认关闭 |
-| 词表并行采样 | LM head 按词表切到整个 stage，只交换少量候选；计数器噪声的 Gumbel-max 采样 | 每个 token 不再收集完整词表 logits；采样结果与并行方式无关 |
-| 分块流水 prefill（`prefill_chunk`） | prompt 分块依次流过各 stage，后面的块使用前面块的 KV Cache | 单请求时各 stage 同时工作，降低首 token 时延 |
-| 激活通信压缩（`comm_dtype`，可选，有损） | TP/SP 集合通信与流水线激活以 float16 / bfloat16 传输，或流水线激活按行 int8 量化 | 通信字节减半（int8 流水线为 1/4），弱网下首 token 时延明显下降 |
+| Fused attention kernels | PyTorch SDPA / the CPU flash kernel; no mask is built when positions allow it; GQA does not replicate K/V | Attention is 11–23× faster at 1024 tokens; its share of single-device prefill drops from about 60% to about 16% |
+| Head-contiguous KV cache | The cache is stored as `[B, H, T, D]` and exposed as a token-major view | Decoding reads the cache without copies; long-context decode attention is about 30% faster |
+| Fused projections | One GEMM each for Q/K/V and for gate/up; RoPE computed once per forward | Prefill projection GEMMs are 6–22% faster |
+| Direct exchange for small messages | All-reduce / all-gather / broadcast of ≤64 KiB is done in one hop with a direct exchange, summed in rank order | Collective latency during decoding drops to about 1/3, bit-identical results; the cost is that all-reduce sends more bytes with more than 2 ranks (about 2× a ring at 4 ranks) |
+| SP decode split (`sp_decode_split`, optional, off by default) | During decoding the SP ranks share the MLP and the attention output projection, and the TP and SP reductions are merged into one stage-wide all-reduce | Less duplicated compute but 1–2 extra collectives per layer: Ulysses decoding is about 10–30% faster on local loopback, but 1.35–2.2× slower on a simulated 100 Mbps/5 ms link, so it is off by default |
+| Vocabulary-parallel sampling | The LM head is split over the vocabulary across the whole stage and only a few candidates are exchanged; Gumbel-max sampling with counter-based noise | No full-vocabulary logits gathered per token; sampling results do not depend on the parallel layout |
+| Chunked pipelined prefill (`prefill_chunk`) | The prompt flows through the stages in chunks; later chunks use the KV cache of earlier ones | All stages work at once on a single request, lowering time to first token |
+| Activation compression (`comm_dtype`, optional, lossy) | TP/SP collectives and pipeline activations travel as float16 / bfloat16, or pipeline activations are quantized to per-row int8 | Half the bytes (a quarter for int8 pipeline activations); time to first token drops noticeably on weak networks |
 
-使用建议：
+Recommendations:
 
-- **通信压缩**优先用 `comm_dtype="float16"`（10 位尾数，超出范围时饱和而不是溢出）。在标准初始化（std 0.02）的随机模型上，float16 的 logits 相对误差 ≤7e-4，bfloat16 ≤6e-3，int8 流水线 ≤8e-3，生成的 16 个 token 全部一致；但在初始化更大（std 0.05）、扰动会逐层放大的随机模型上，bfloat16 / int8 会明显改变输出。请在目标模型上验证 bfloat16 / int8 的精度后再使用。
-- **SP 解码拆分**默认关闭：它用额外的集合通信换取更少的重复计算。在高延迟的边缘链路上通信代价更高；在低延迟链路上、模型较大或 Ulysses 模式时可以开启（`sp_decode_split=True` / `--sp-decode-split`）并实测对比。
-- **分块流水 prefill** 在 `pp_size > 1` 时默认开启（每个 stage 约 2 块，至少 128 token）。实测单请求时 PP4 首 token 时延快约 1.9 倍；在一台机器上模拟多设备时，各进程共享内存带宽，收益会小于真实的多设备部署。
-- **OpenMP 线程等待策略**：`launch_local` 模拟多设备时默认设置 `OMP_WAIT_POLICY=PASSIVE`，避免空转的计算线程抢占通信线程（实测 TP2 解码约快 20%）；但它会让单进程的小算子唤醒变慢。在真实设备上可以两种都测一下。
-- **权重精度**：本仓库测试的 x86 CPU 没有原生 bf16 指令，PyTorch 的 int8 权重算子比 fp32 慢 4.6–58 倍，因此没有提供 int8 权重量化；`dtype=torch.bfloat16` 解码约快 1.4 倍、内存减半，但 prefill 约慢 4 倍。在带原生 bf16/int8 指令的设备上结论可能不同。
+- For **communication compression**, prefer `comm_dtype="float16"` (10-bit mantissa; out-of-range values saturate instead of overflowing). On random models with standard initialization (std 0.02), the relative logit error is ≤7e-4 for float16, ≤6e-3 for bfloat16 and ≤8e-3 for the int8 pipeline, and all 16 generated tokens match. On random models with larger initialization (std 0.05), where perturbations grow from layer to layer, bfloat16 / int8 change the output noticeably. Validate bfloat16 / int8 accuracy on your target model before using them.
+- **SP decode split** is off by default: it trades extra collectives for less duplicated compute, and communication costs more on high-latency edge links. On low-latency links, with larger models or in Ulysses mode, enable it (`sp_decode_split=True` / `--sp-decode-split`) and measure.
+- **Chunked pipelined prefill** is on by default when `pp_size > 1` (about 2 chunks per stage, at least 128 tokens each). It made PP4 time to first token about 1.9× faster on a single request in our measurements; when several devices are simulated on one machine the processes share memory bandwidth, so the gain is smaller than on a real multi-device deployment.
+- **OpenMP wait policy**: when `launch_local` simulates several devices it sets `OMP_WAIT_POLICY=PASSIVE` by default, so idle compute threads do not starve the communication threads (TP2 decoding measured about 20% faster). It makes waking up small ops slower in a single process, though, so on real devices it is worth measuring both.
+- **Weight precision**: the x86 CPU this repository was tested on has no native bf16 instructions, and PyTorch's int8 weight kernels were 4.6–58× slower than fp32 there, so int8 weight quantization is not provided. `dtype=torch.bfloat16` decodes about 1.4× faster with half the memory, but prefill is about 4× slower. The conclusions may differ on devices with native bf16/int8 instructions.
 
 ---
 
-## 配置参考
+## Configuration reference
 
-`ParallelConfig` 字段：
+`ParallelConfig` fields:
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Description |
 | --- | --- | --- |
-| `tp_size` / `pp_size` / `sp_size` | 1 | 三个维度的并行度，乘积等于进程数 |
-| `sp_mode` | `"ring"` | `"ring"`（KV 块环形传递，KV Cache 按序列切分）或 `"ulysses"`（all-to-all，KV Cache 按注意力头切分） |
-| `sp_layout` | `"contiguous"` | `"zigzag"` 让因果注意力下各 rank 的计算量均衡 |
-| `megatron_sp` | `False` | TP 组内再做 Megatron 序列并行（norm/残差只处理 1/tp 的 token） |
-| `tp_weights` | `None` | TP 各 rank 的相对能力；一维列表（所有 stage 共用）或每个 stage 一个列表 |
-| `sp_weights` | `None` | SP 各 rank 的相对能力（非均匀 token 划分） |
-| `pp_layers` | `None` | 每个 stage 的层数（默认均分） |
-| `num_microbatches` | `pp_size` | 流水线 micro-batch 数 |
-| `prefill_chunk` | 自动 | 把 prompt 切成若干块在流水线各 stage 间并行流动（降低单请求首 token 时延）；`None` 在 `pp_size > 1` 时自动选择块大小，`0` 关闭 |
-| `sp_decode_split` | `False` | 解码时 SP 各 rank 分担 MLP 和注意力输出投影，而不是各自重复计算整层（无损，但每层多 1–2 次集合通信；只在解码计算明显多于通信延迟时开启，例如模型较大、链路很快） |
-| `comm_dtype` | `None` | 有损的激活通信压缩：`"float16"` / `"bfloat16"`（字节减半），`"int8"`（流水线激活按行 int8 量化，集合通信用 bfloat16） |
-| `attn_kv_block` | `None` | 注意力按 key 分块计算，限制长序列的峰值内存 |
-| `network` | `None` | `NetworkConfig(bandwidth_mbps, latency_ms)` 网络模拟 |
+| `tp_size` / `pp_size` / `sp_size` | 1 | Degree of each parallel dimension; their product equals the number of processes |
+| `sp_mode` | `"ring"` | `"ring"` (KV blocks passed around a ring, KV cache split along the sequence) or `"ulysses"` (all-to-all, KV cache split across attention heads) |
+| `sp_layout` | `"contiguous"` | `"zigzag"` balances the per-rank compute of causal attention |
+| `megatron_sp` | `False` | Megatron sequence parallelism inside the TP group (norm/residual only process 1/tp of the tokens) |
+| `tp_weights` | `None` | Relative capability of the TP ranks; a flat list (shared by all stages) or one list per stage |
+| `sp_weights` | `None` | Relative capability of the SP ranks (uneven token split) |
+| `pp_layers` | `None` | Number of layers per stage (even split by default) |
+| `num_microbatches` | `pp_size` | Number of pipeline micro-batches |
+| `prefill_chunk` | auto | Cuts the prompt into chunks that flow through the pipeline stages in parallel (lower time to first token for a single request); `None` picks a chunk size automatically when `pp_size > 1`, `0` disables it |
+| `sp_decode_split` | `False` | During decoding the SP ranks share the MLP and attention output projection instead of each recomputing the whole layer (lossless, but 1–2 extra collectives per layer; enable only when decode compute clearly outweighs communication latency, e.g. larger models on fast links) |
+| `comm_dtype` | `None` | Lossy activation compression: `"float16"` / `"bfloat16"` (half the bytes), `"int8"` (per-row int8 for pipeline activations, bfloat16 for collectives) |
+| `attn_kv_block` | `None` | Computes attention in key blocks to bound peak memory on long sequences |
+| `network` | `None` | `NetworkConfig(bandwidth_mbps, latency_ms)` network simulation |
 
 ---
 
-## 关键设计
+## Key design decisions
 
-- **按位置掩码的注意力。** 注意力掩码由每个 token 携带的真实位置决定（`k_pos <= q_pos`，`-1` 表示 padding），而不是依赖张量下标。因此 token 在设备间如何分布（连续、zigzag、非均匀、被缓存在任意 rank）都不影响正确性。注意力同时返回 log-sum-exp，多个部分结果可以**精确合并**，这是 ring attention 和分布式 KV 解码的基础。
-- **SP 的 prefill / decode 两种形态。** Prefill 时 token 按 `SequenceLayout` 切分到 SP 组（ring 或 Ulysses）；decode 时新 token 在 SP 组内复制，各 rank 只对自己持有的那部分 KV Cache 计算注意力，再用 LSE 合并（每层一次很小的 all-gather），KV Cache 始终分布式存储。Ring 模式下新 token 的 KV 写入当前缓存最少的 rank，所有 rank 用同样的确定性规则得出一致结论，无需额外通信。
-- **GQA 感知的头划分。** 优先按整个 KV 组分配注意力头，避免复制 KV；KV 头少于设备数（如 MQA）时自动复制所需的 KV 头。TP 之后 Ulysses 还会在本地头上再划分一次，同样处理不规则分组。
-- **自描述的流水线通道。** `P2PChannel` 的每条消息带一个固定大小的头（消息类型、dtype、shape），stage 之间无需预先知道激活形状；`STOP` 控制消息随数据流传递，用于提前结束已生成完毕（EOS）的 micro-batch。生成时，最后一个 stage 采样后把 token 送回第一个 stage，多个 micro-batch 在流水线中交错，使所有 stage 保持忙碌。
-- **词表并行采样。** LM head 在最后一个 stage 的所有 rank 上按词表切分，每个 rank 只提出少量候选，一次很小的 all-gather 后所有 rank 用纯比较得出相同的 token（贪心、温度采样、top-k），不需要收集完整词表的 logits，也不需要再广播；top-p 由一个 rank 决定后广播，候选不足以覆盖 nucleus 时自动退回完整词表，保证精确。随机采样使用 Gumbel-max 与按 `(seed, 序列, 步数, token)` 计算的计数器噪声，因此采样结果与并行方式和 micro-batch 划分无关，且即使异构硬件的 logits 有细微差别，各 rank 的结果也严格一致。
-- **后端兼容。** gloo 在一些版本中不支持非均匀的 all-gather / all-to-all（本仓库在 torch 2.14 上实测）：all-gather 采用补齐后裁剪的方式，all-to-all 采用 `all_to_all_single` 的非均匀 split，不支持时自动回退到点对点实现。
-- **小消息直接交换。** gloo 的 all-reduce 对解码阶段的小张量需要多步往返；不超过 64 KiB 的 all-reduce / all-gather / broadcast 改为所有 rank 一跳直接交换（实测延迟约为原来的 1/3），all-reduce 按固定 rank 顺序求和，结果在所有 rank 上逐位相同。代价是多于 2 个 rank 时 all-reduce 的发送字节更多（每个 rank 把整个张量直接发给其余 N−1 个 rank，4 个 rank 时约为 ring 算法的 2 倍），但这些消息很小，主要开销是时延；阈值可通过环境变量 `COLLAB_INFER_SMALL_MSG_BYTES` 或 `ParallelContext(small_message_bytes=...)` 调整，设为 0 即关闭。
-- **注意力内核。** 注意力交给 PyTorch 的融合算子（SDPA；需要 LSE 时使用 CPU flash kernel）。位置允许时不构造掩码（无 padding 的 prefill 用 `is_causal`，解码时所有缓存的 key 都可见则不需要掩码），GQA 不复制 K/V，需要掩码时按 query 分块以限制内存；KV Cache 按 head 连续存储。
+- **Position-masked attention.** The attention mask is derived from the true position carried by each token (`k_pos <= q_pos`, `-1` for padding) rather than from tensor indices. Correctness therefore does not depend on how tokens are distributed across devices (contiguous, zigzag, uneven, or cached on any rank). Attention also returns the log-sum-exp, so partial results can be **merged exactly**; this is the basis of ring attention and distributed KV decoding.
+- **Two shapes of SP: prefill and decode.** During prefill, tokens are split over the SP group according to a `SequenceLayout` (ring or Ulysses). During decoding the new token is replicated within the SP group; each rank attends only over the part of the KV cache it holds, and the results are merged with the LSE (one small all-gather per layer), so the KV cache always stays distributed. In ring mode, the KV of a new token is written to the rank whose cache is currently smallest; every rank reaches the same decision with the same deterministic rule, with no extra communication.
+- **GQA-aware head partitioning.** Attention heads are assigned by whole KV groups where possible to avoid replicating KV; when there are fewer KV heads than devices (e.g. MQA), the needed KV heads are replicated automatically. After TP, Ulysses splits the local heads once more and handles irregular groupings the same way.
+- **Self-describing pipeline channels.** Every `P2PChannel` message carries a fixed-size header (message type, dtype, shape), so stages do not need to know activation shapes in advance. A `STOP` control message travels with the data stream to retire micro-batches that have finished (EOS) early. During generation the last stage samples and sends the token back to the first stage, and several micro-batches interleave in the pipeline to keep every stage busy.
+- **Vocabulary-parallel sampling.** The LM head is split over the vocabulary across all ranks of the last stage. Each rank proposes a few candidates, and after one small all-gather every rank arrives at the same token by pure comparison (greedy, temperature, top-k), without gathering full-vocabulary logits or broadcasting again. Top-p is decided by one rank and broadcast; when the candidates cannot cover the nucleus it falls back to the full vocabulary, so the result stays exact. Random sampling uses Gumbel-max with counter-based noise computed from `(seed, sequence, step, token)`, so sampling results do not depend on the parallel layout or micro-batch split, and all ranks agree exactly even if heterogeneous hardware produces slightly different logits.
+- **Backend compatibility.** In some versions gloo does not support uneven all-gather / all-to-all (observed on torch 2.14 in this repository): all-gather pads and then trims, all-to-all uses uneven splits of `all_to_all_single`, and the code falls back to point-to-point implementations automatically when those are unsupported.
+- **Direct exchange for small messages.** gloo's all-reduce needs several round trips for the small tensors of the decode phase. All-reduce / all-gather / broadcast of at most 64 KiB is instead done by every rank in a single direct exchange (measured latency about 1/3 of before); all-reduce sums in a fixed rank order, so the result is bit-identical on every rank. The cost is that all-reduce sends more bytes with more than 2 ranks (each rank sends the whole tensor directly to the other N−1 ranks, about 2× a ring algorithm at 4 ranks), but these messages are small and dominated by latency. The threshold can be set with the `COLLAB_INFER_SMALL_MSG_BYTES` environment variable or `ParallelContext(small_message_bytes=...)`; 0 disables it.
+- **Attention kernels.** Attention is delegated to PyTorch's fused operators (SDPA; the CPU flash kernel when the LSE is needed). No mask is built when positions allow it (`is_causal` for prefill without padding; no mask during decoding when every cached key is visible), GQA does not replicate K/V, and queries are processed in chunks to bound memory when a mask is needed. The KV cache is stored head-contiguous.
 
 ---
 
-## 测试
+## Tests
 
 ```bash
-pip install pytest            # 可选：pip install transformers safetensors 以运行 HF 对齐测试
+pip install pytest            # optional: pip install transformers safetensors to run the HF parity tests
 python -m pytest tests -q
 ```
 
-测试用 gloo 在本机启动多进程，覆盖：通信原语（原生/回退实现、小消息直接交换、非均匀大小、压缩、网络模拟）、TP 层与 `parallelize_module`、ring / Ulysses / 分布式 KV 注意力、流水线通道（含各种压缩编码）与 runner、词表并行采样（与单设备逐 token 一致、采样频率符合目标分布）、规划器（DP 与暴力搜索对照）、以及引擎的完整矩阵——每种配置在每个 rank 上检查 prefill logits、贪心生成的 token 和逐步 logits 与独立参考实现一致，另外还测试 EOS、采样跨并行方式一致性、KV Cache 确实被均分，以及压缩通信的误差与字节数。
+The tests launch multiple local processes over gloo and cover: communication primitives (native and fallback implementations, direct small-message exchange, uneven sizes, compression, network simulation), TP layers and `parallelize_module`, ring / Ulysses / distributed-KV attention, pipeline channels (including every compression encoding) and the runner, vocabulary-parallel sampling (token-by-token identical to a single device; sampling frequencies match the target distribution), the planner (DP checked against brute force), and the full engine matrix: for every configuration, every rank checks that prefill logits, greedily generated tokens and per-step logits match the independent reference implementation. EOS handling, sampling consistency across parallel layouts, even distribution of the KV cache, and the error and byte counts of compressed communication are tested too.
+
+CI runs the whole suite, including the Hugging Face parity tests, on every push and pull request (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
 
-## 局限与后续工作
+## Limitations and future work
 
-- 只在 CPU + gloo 上实际测试过；CUDA / NCCL 与 CPU/GPU 混合路径按设计支持，但未在本仓库的测试环境中验证。
-- 注意力在 CPU 上使用 PyTorch 融合算子；GPU 上需要 LSE 的路径（ring attention、分布式 KV 解码）目前使用数学实现，尚未接入 CUDA 融合算子。
-- 模型族目前为 LLaMA / Mistral / Qwen2；其他结构可以直接组合 `parallel/` 中的原语。
-- 暂未实现连续批处理（continuous batching）、投机解码、权重量化，以及运行时的动态重新划分（设备掉线 / 负载变化）。在本仓库测试的 x86 CPU（AVX-512，无原生 bf16）上，PyTorch 自带的 int8 权重算子比 fp32 慢 4.6–58 倍，因此没有提供 int8 权重量化；bf16 权重（`dtype=torch.bfloat16`）可使解码快约 1.4 倍、内存减半，但 prefill 会慢约 4 倍。
-- 规划器的代价模型是解析估计，用于比较策略、确定非均匀切分比例，不追求绝对时延的精确预测。
+- Only tested on CPU + gloo. CUDA / NCCL and mixed CPU/GPU paths are supported by design but have not been verified in this repository's test environment.
+- On CPU, attention uses PyTorch's fused operators; on GPU, the paths that need the LSE (ring attention, distributed KV decoding) currently use the math implementation and are not yet wired to CUDA fused kernels.
+- The supported model families are currently LLaMA / Mistral / Qwen2; other architectures can be built directly from the primitives in `parallel/`.
+- Continuous batching, speculative decoding, weight quantization and dynamic re-partitioning at runtime (device dropout / load changes) are not implemented yet. On the x86 CPU this repository was tested on (AVX-512, no native bf16), PyTorch's built-in int8 weight kernels were 4.6–58× slower than fp32, so int8 weight quantization is not provided; bf16 weights (`dtype=torch.bfloat16`) make decoding about 1.4× faster with half the memory, but prefill about 4× slower.
+- The planner's cost model is an analytical estimate meant for comparing strategies and choosing uneven split ratios, not for predicting absolute latency precisely.
 
-## 目录结构
+---
+
+## Repository layout
 
 ```
 collab_infer/
   config.py              ParallelConfig / NetworkConfig
-  distributed/           comm.py（Communicator）、mesh.py（ParallelContext）、launcher.py
-  parallel/              partition.py、attention.py、tensor_parallel.py、sequence_parallel.py、pipeline_parallel.py
-  models/                config.py（ModelConfig、预设）、llama.py（并行模型）、cache.py、weights.py
-  engine/                engine.py（CollabEngine）、sampling.py
-  planner/               planner.py（规划、代价模型、策略搜索）
-  cli.py                 命令行（generate / plan）
+  distributed/           comm.py (Communicator), mesh.py (ParallelContext), launcher.py
+  parallel/              partition.py, attention.py, tensor_parallel.py, sequence_parallel.py, pipeline_parallel.py
+  models/                config.py (ModelConfig, presets), llama.py (parallel model), cache.py, weights.py
+  engine/                engine.py (CollabEngine), sampling.py
+  planner/               planner.py (planning, cost model, strategy search)
+  cli.py                 command line (generate / plan)
 examples/                quickstart / custom_models / heterogeneous_edge / benchmark_strategies
-tests/                   单元测试与多进程等价性测试
+tests/                   unit tests and multi-process equivalence tests
 ```
+
+---
+
+## License
+
+[MIT](LICENSE)
